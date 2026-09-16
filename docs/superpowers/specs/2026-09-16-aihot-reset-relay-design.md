@@ -38,7 +38,8 @@ WeCom / Feishu / DingTalk / Telegram / Bark / ntfy / Slack / Generic Webhook
 - Ignore historical backfills or regrouped old posts instead of notifying them as fresh events.
 - Persist immutable signals and per-target delivery outcomes in Cloudflare Workers KV.
 - Retry only retryable failed delivery targets, with backoff and a per-run delivery budget.
-- Provide a protected test-notification endpoint that does not fetch AIHOT.
+- Provide an authenticated `GET /latest` operator endpoint that performs a fresh AIHOT fetch and sends the real latest source post to configured notification targets.
+- Keep `/latest` convenient for mobile use by allowing the authenticated URL to be bookmarked directly.
 - Support multiple notification channels and multiple targets per channel.
 - Provide public status and health endpoints without exposing secrets.
 - Include automated tests and GitHub Actions CI.
@@ -82,6 +83,7 @@ The implementation must behave as a respectful API client:
 - On `429`, persist a source backoff deadline derived from `Retry-After` and do not fetch AIHOT again before that deadline.
 - On upstream `5xx` or network failure, preserve committed source state and retry on a later Cron run.
 - Never advance source commit state after schema validation, persistence, or parsing failure.
+- The authenticated `/latest` route must also honor source backoff and must not bypass an active `Retry-After` window.
 
 ## 4. AIHOT API semantics used by the project
 
@@ -222,23 +224,9 @@ Conceptual value:
     "postIdsAtPublishedAt": ["123", "456"]
   },
   "sourceCheckedAt": "...",
-  "lastCommittedAt": "...",
-  "latestNotification": {
-    "signalId": "post:123",
-    "kind": "source_post",
-    "title": "...",
-    "content": "...",
-    "publishedAt": "...",
-    "eventType": "...",
-    "eventStatus": "...",
-    "scope": "...",
-    "sourceUrl": "https://...",
-    "aihotUrl": "https://aihot.news/..."
-  }
+  "lastCommittedAt": "..."
 }
 ```
-
-`latestNotification` is the latest committed real source-post notification and is used by the protected test endpoint. The test endpoint must not fetch AIHOT.
 
 ### `signal:<signalId>`
 
@@ -324,7 +312,24 @@ Stores AIHOT source rate-limit/backoff state separately from committed source me
 }
 ```
 
-A source backoff record must be checked before any AIHOT fetch.
+A source backoff record must be checked before any AIHOT fetch, including `/latest`.
+
+### `manual:latest`
+
+Stores only best-effort accidental-repeat protection for the authenticated manual route:
+
+```json
+{
+  "lastAcceptedAt": "..."
+}
+```
+
+Rules:
+
+- `/latest` checks this cooldown record **after authentication but before any AIHOT fetch**.
+- If the previous accepted invocation was less than 10 seconds ago, return a sanitized duplicate/cooldown response and do not call AIHOT or notification targets.
+- This record is not an authentication mechanism and is not relied upon for abuse prevention.
+- Workers KV is eventually consistent, so the cooldown is best-effort and intended to absorb double taps, browser refreshes, and preview reloads.
 
 ### `diag:last`
 
@@ -380,7 +385,7 @@ Conceptual shape:
 }
 ```
 
-This payload is persisted inside the signal before dispatch.
+This payload is persisted inside the signal before automatic dispatch. The manual `/latest` route builds the same canonical structure from its freshly fetched AIHOT snapshot but does not create or mutate automatic signal/delivery state.
 
 ## 8. Snapshot validation and watermark algorithm
 
@@ -443,7 +448,7 @@ Signal retention must never be used as the only memory of the watermark boundary
 
 The source commit boundary is normative.
 
-For AIHOT `200`:
+For AIHOT `200` in the automatic monitoring path:
 
 ```text
 fetch snapshot
@@ -458,7 +463,7 @@ sort new signals deterministically
   ↓
 persist every new immutable signal + targetIds
   ↓
-commit meta:v4 with new ETag + W1 + latestNotification
+commit meta:v4 with new ETag + W1
   ↓
 dispatch new signals and eligible backlog
   ↓
@@ -471,8 +476,9 @@ Rules:
 - If any required new signal write fails before the source commit, do not update `meta:v4`.
 - Partially written signal keys are safe: a later retry deduplicates by stable `signalId`.
 - Never save a new ETag after an incompatible schema or failed pre-commit persistence step.
-- Only the final `meta:v4` write commits the accepted snapshot boundary.
+- Only the final `meta:v4` write commits the accepted automatic snapshot boundary.
 - A later `304` is safe because retryable notification payloads are already stored inside `signal:*` keys.
+- Manual `/latest` is intentionally read-and-send only with respect to automatic source state: it does not advance ETag, watermark, signal keys, or automatic delivery keys.
 
 ## 10. Signal ordering
 
@@ -530,9 +536,10 @@ SLACK_WEBHOOK_URL
 GENERIC_WEBHOOK_URL
 GENERIC_WEBHOOK_TEMPLATE
 
-ENABLE_TEST_ENDPOINT
-TEST_TOKEN
+LATEST_ACCESS_KEY
 ```
+
+`LATEST_ACCESS_KEY` is mandatory for the `/latest` route and must be stored as a Cloudflare Secret, not a plaintext committed variable. It must be a cryptographically random high-entropy value; V1 recommends at least 256 random bits encoded using a URL-safe representation such as Base64URL.
 
 Webhook-style values may use `;` to configure multiple targets.
 
@@ -603,6 +610,8 @@ Source monitoring has priority over backlog processing.
 A Cron invocation must cap external notification attempts. V1 default target: at most 10 delivery attempts per run, including new-signal deliveries and retry backlog.
 
 If more eligible work exists, leave it durable for the next Cron.
+
+The manual `/latest` route is not part of the automatic retry queue and does not create persistent delivery work; it attempts each currently configured target once and returns sanitized per-target results.
 
 ## 13. Cron execution flow
 
@@ -681,43 +690,74 @@ Never return credentials, raw target hashes, webhook URLs, bot tokens, chat IDs,
 
 Minimal read-only health endpoint with sanitized status only.
 
-### `POST /test/notify`
+### `GET /latest`
 
-V1 keeps a test endpoint because deployers need a reliable way to verify notification formatting and target connectivity. It is deliberately separated from source fetching.
-
-Security and behavior rules:
-
-1. The endpoint is disabled by default.
-2. It is enabled only when `ENABLE_TEST_ENDPOINT=true`.
-3. When enabled, `TEST_TOKEN` is required.
-4. The caller must send:
+V1 keeps `/latest` as a mobile-friendly full-path test and operator endpoint. It intentionally performs a fresh AIHOT fetch so a legal user can verify the complete path:
 
 ```text
-Authorization: Bearer <TEST_TOKEN>
+AIHOT → Worker validation → latest-post selection → notification adapters → configured targets
 ```
 
-5. The endpoint must reject unauthorized requests before reading notification targets or performing any external request.
-6. The endpoint must **not fetch AIHOT**.
-7. It reads `meta:v4.latestNotification`, which represents the latest committed real source-post notification already obtained by Cron.
-8. If no committed latest notification exists yet, return `409` with a sanitized `no_committed_source` reason.
-9. It sends the cached notification to currently configured targets and returns sanitized per-channel results.
-10. It does not modify automatic signal/delivery state.
-11. An optional request body may restrict the test to one channel, for example:
+The route remains `GET` so the complete authenticated URL can be saved as a browser bookmark or added to a phone home screen.
 
-```json
-{
-  "channel": "wework"
-}
+#### Authentication
+
+The caller must provide:
+
+```text
+GET /latest?key=<LATEST_ACCESS_KEY>
 ```
 
-If omitted, the test targets all configured channels.
+Security rules:
 
-12. `GET /test/notify` is not supported.
-13. There is no public unauthenticated manual notification endpoint in V1.
+1. `LATEST_ACCESS_KEY` is required; there is no unauthenticated fallback.
+2. The key must be validated before reading notification targets, checking source data, or making any external request.
+3. Missing or incorrect keys return `403` immediately.
+4. Authentication failure must never trigger an AIHOT request or notification request.
+5. The implementation must never log the provided key, raw query string, or complete request URL.
+6. Public status/health responses never reveal whether a candidate key is close to or derived from the real key.
+7. The key can be rotated at any time by replacing the Cloudflare Secret; old bookmarked URLs then become invalid.
 
-This endpoint is for notification-path verification, not for forcing a fresh AIHOT poll.
+A static high-entropy capability URL is an explicit usability/security trade-off chosen for mobile convenience. V1 does not use MD5, TOTP, or per-request HMAC signatures because those would add manual steps without improving the practical security of a bookmarked static operator link.
 
-Deployers who want another layer of protection may place `/test/*` behind Cloudflare Access. That is optional defense-in-depth and not required for portability.
+#### Pre-fetch abuse controls
+
+After authentication and **before fetching AIHOT**:
+
+1. Check `manual:latest`.
+2. If the last accepted manual call was less than 10 seconds ago, return a sanitized cooldown response and do not call AIHOT or any notification target.
+3. Check `source:backoff`.
+4. If an AIHOT `Retry-After` / source backoff window is active, return a sanitized backoff response and do not call AIHOT.
+5. Only after these checks may `/latest` fetch AIHOT.
+
+The 10-second cooldown is best-effort duplicate protection, not the primary security boundary. The high-entropy access key is the primary authorization boundary.
+
+#### Fresh AIHOT path
+
+For an accepted call:
+
+1. Fetch the current AIHOT Codex Reset snapshot without relying on automatic delivery state.
+2. Validate the snapshot using the same schema and safety rules as the automatic path.
+3. Traverse every event and source post.
+4. Select the globally newest source post by `posts[].publishedAt`; never use `events[0]` as a latest-post shortcut.
+5. Build the same canonical notification model used by automatic signals.
+6. Send it once to every currently configured target.
+7. Return sanitized per-channel/target results.
+8. Do not create automatic signals, modify automatic delivery keys, or advance the automatic ETag/watermark.
+
+A manual `/latest` call therefore does not suppress a later automatic notification for the same real source post.
+
+#### Response/privacy headers
+
+All `/latest` responses must include at least:
+
+```text
+Cache-Control: no-store
+Referrer-Policy: no-referrer
+X-Robots-Tag: noindex, nofollow
+```
+
+The project documentation must warn that the authenticated bookmark contains a secret in its URL and should not be shared, pasted into public issue reports, or used on untrusted devices. Browser history or sync systems may retain the full URL; users who suspect disclosure should rotate `LATEST_ACCESS_KEY` immediately.
 
 ### Unknown routes
 
@@ -733,10 +773,9 @@ When `stateVersion !== 4` or no valid V4 commit exists:
 2. Validate the snapshot fully.
 3. Build the boundary watermark from all current source posts.
 4. Record current `receipt_review:<event.id>` signals as baseline-known without notification.
-5. Persist the latest committed source notification into `meta:v4.latestNotification` for testing.
-6. Commit `meta:v4` only after baseline preparation succeeds.
-7. Do not send historical notifications.
-8. Record migration diagnostics as `migrated`.
+5. Commit `meta:v4` only after baseline preparation succeeds.
+6. Do not send historical notifications.
+7. Record migration diagnostics as `migrated`.
 
 Migration must not create signal/delivery work for historical source posts.
 
@@ -771,6 +810,8 @@ Store concise sanitized diagnostics, including:
 - sanitized last errors.
 
 Never persist full secrets in logs, KV values, errors, or HTTP responses.
+
+For `/latest`, logs and diagnostics may record only sanitized facts such as route name, authentication success/failure category, cooldown/backoff category, and aggregate delivery result. They must not include the access key, raw query string, or full request URL.
 
 ## 19. Testing strategy
 
@@ -836,12 +877,16 @@ Mock `fetch()` and verify:
 Mandatory tests:
 
 - `/` and `/health` never expose secrets or target hashes;
-- `POST /test/notify` is unavailable by default;
-- enabled test endpoint without valid bearer token returns unauthorized before external requests;
-- authorized test reads only committed cached notification data and does not fetch AIHOT;
-- authorized test can restrict delivery to one channel;
-- test endpoint does not mutate automatic delivery state;
-- `GET /test/notify` is rejected;
+- `/latest` without a key returns `403` before any external request;
+- `/latest` with a wrong key returns `403` before any external request;
+- authenticated `/latest` checks the 10-second cooldown before AIHOT;
+- authenticated `/latest` obeys `source:backoff` before AIHOT;
+- accepted `/latest` performs a fresh AIHOT fetch;
+- `/latest` selects the real newest source post by `publishedAt`;
+- `/latest` sends the fresh result to currently configured targets;
+- `/latest` does not mutate automatic signal/delivery or source-commit state;
+- `/latest` responses include `no-store`, `no-referrer`, and `noindex` protections;
+- logs never contain the raw access key or complete query URL;
 - unknown routes return 404.
 
 ## 20. CI
@@ -867,12 +912,13 @@ Provide:
 - KV binding instructions using `CODEX_RESET_STATE`.
 - Secret configuration for every supported channel.
 - Cron configuration.
-- Test-endpoint setup with `ENABLE_TEST_ENDPOINT` and `TEST_TOKEN`.
-- Explicit warning that the test endpoint must not be exposed without its bearer token.
-- Optional Cloudflare Access hardening guidance.
+- `LATEST_ACCESS_KEY` generation and Cloudflare Secret configuration.
+- A mobile-friendly `/latest?key=...` bookmark example.
+- Explicit warning that the bookmarked URL itself contains a secret and must not be shared.
+- Access-key rotation guidance.
 - Troubleshooting/FAQ.
 - AIHOT attribution and API/data-usage statement.
-- Security guidance: never commit real webhook URLs, bot tokens, `.env`, or `.dev.vars`.
+- Security guidance: never commit real webhook URLs, bot tokens, `.env`, `.dev.vars`, or `LATEST_ACCESS_KEY`.
 
 README must describe the project as an independent community project, not an official AIHOT product.
 
@@ -886,8 +932,11 @@ README must describe the project as an independent community project, not an off
 - Never log complete target credentials.
 - Treat all upstream AIHOT-rendered text as untrusted content.
 - Generic Webhook templates use structured substitution.
-- The test endpoint uses POST, is disabled by default, requires a bearer token when enabled, and never fetches AIHOT.
-- A source `Retry-After` deadline is checked before every AIHOT fetch.
+- `/latest` always requires a high-entropy `LATEST_ACCESS_KEY`; there is no unauthenticated mode.
+- `/latest` validates authorization, cooldown, and source backoff before any AIHOT or notification fetch.
+- `/latest` never logs the raw query string, complete request URL, or access key.
+- `/latest` responses are non-cacheable and suppress referrer leakage.
+- A source `Retry-After` deadline is checked before every AIHOT fetch, including manual `/latest`.
 
 ## 23. Success criteria for V1
 
@@ -906,9 +955,10 @@ V1 is complete when:
 11. Removed/re-added targets do not receive unintended historical replay.
 12. External text cannot inject platform markup, mass mentions, unsafe URLs, or malformed Generic Webhook JSON.
 13. No public HTTP route exposes credentials or target secret hashes.
-14. The test endpoint is disabled by default, requires bearer authorization when enabled, and never amplifies AIHOT traffic.
-15. V4 migration does not replay historical notifications.
-16. README clearly credits AIHOT and explains the independent code-license/API-use boundary.
+14. A bookmarked authenticated `GET /latest` provides a one-tap mobile full-path test while unauthenticated requests cannot trigger AIHOT or notification traffic.
+15. `/latest` respects accidental-repeat cooldown and upstream `Retry-After` before fetching AIHOT.
+16. V4 migration does not replay historical notifications.
+17. README clearly credits AIHOT and explains the independent code-license/API-use boundary.
 
 ## 24. Future extensions
 
@@ -916,11 +966,11 @@ Potential future work, not required for V1:
 
 - Email delivery.
 - Additional adapters such as Gotify or PushDeer.
-- Optional Cloudflare Workers Rate Limiting binding for test/admin routes.
-- Optional Cloudflare Access recipes for browser-authenticated operator access.
+- Optional Cloudflare Workers Rate Limiting binding for operator routes.
+- Optional Cloudflare Access recipes for stronger browser-authenticated operator access.
+- Optional time-limited HMAC or TOTP operator links for users who prefer stronger rotating credentials over one-tap bookmarks.
 - Durable Objects only if future features require strict coordination or transactional counters.
 - Optional GitHub-to-Cloudflare automatic deployment.
 - Richer operational dashboard.
-- A dedicated authenticated endpoint to force a fresh AIHOT poll, if a real operational need emerges later.
 
 These extensions must not weaken AIHOT attribution, API-use compliance, source commit invariants, secret isolation, or the per-target delivery-state model.
