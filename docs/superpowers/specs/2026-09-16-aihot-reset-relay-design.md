@@ -31,10 +31,10 @@ WeCom / Feishu / DingTalk / Telegram / Bark / ntfy / Slack / Generic Webhook
 - Monitor `https://aihot.news/api/v1/codex-resets`.
 - Poll every 30 minutes using a Cloudflare Cron Trigger.
 - Use ETag / `If-None-Match` conditional requests.
-- Respect AIHOT rate limiting, including `429` and `Retry-After`.
+- Respect AIHOT rate limiting and upstream backoff, including `Retry-After` where present.
 - Detect new source posts using `posts[].id`.
 - Use `posts[].publishedAt` as the source-post chronology boundary.
-- Detect `receipt_review` confirmations even when no new source post exists.
+- Detect anchored `receipt_review` confirmations even when no new confirmation source post exists.
 - Ignore historical backfills or regrouped old posts instead of notifying them as fresh events.
 - Persist immutable signals and per-target delivery outcomes in Cloudflare Workers KV.
 - Retry only retryable failed delivery targets, with backoff and a per-run delivery budget.
@@ -80,10 +80,11 @@ The implementation must behave as a respectful API client:
 - Default polling interval: 30 minutes.
 - Conditional GET via ETag.
 - No concurrent retry storm.
-- On `429`, persist a source backoff deadline derived from `Retry-After` and do not fetch AIHOT again before that deadline.
-- On upstream `5xx` or network failure, preserve committed source state and retry on a later Cron run.
+- Any response that carries a valid `Retry-After` must establish a source backoff deadline that Cron and `/latest` both obey before any further AIHOT fetch.
+- `429` always uses `Retry-After` when present.
+- `503` and other upstream failures use `Retry-After` when present; otherwise `5xx` and network failures use exponential source backoff.
+- Successful `200` or `304` resets the consecutive source-failure counter and clears expired failure backoff state.
 - Never advance source commit state after schema validation, persistence, or parsing failure.
-- The authenticated `/latest` route must also honor source backoff and must not bypass an active `Retry-After` window.
 
 ## 4. AIHOT API semantics used by the project
 
@@ -100,7 +101,7 @@ Relevant top-level fields:
 
 Important event fields:
 
-- `id`: AIHOT event identifier.
+- `id`: AIHOT event identifier. V1 does **not** assume this is a permanent logical-event identity across all future regrouping/correction behavior.
 - `type`: e.g. `direct_reset` or `reset_credit`.
 - `label`: display label.
 - `status`: e.g. `announced` or `confirmed`.
@@ -117,7 +118,7 @@ Important event fields:
 
 Important source-post fields:
 
-- `id`: stable source-post identifier.
+- `id`: stable source-post identifier used by this project for source-post deduplication and receipt-review anchoring.
 - `publishedAt`: actual source-post publication time.
 - `stage`: stage represented by that source post.
 - `text`: AIHOT Chinese translation.
@@ -232,7 +233,7 @@ Conceptual value:
 
 Signals are immutable durable work items.
 
-Conceptual value:
+Conceptual source-post value:
 
 ```json
 {
@@ -258,6 +259,8 @@ Conceptual value:
 ```
 
 A signal must contain the complete canonical notification payload required for future delivery. This is required so pending deliveries remain retryable even when a later AIHOT request returns `304` or the upstream source is temporarily unavailable.
+
+Receipt-review signals additionally persist their anchoring metadata, including the canonical anchor post ID and the source-post IDs observed in the event at creation time.
 
 ### `delivery:<signalId>:<targetId>`
 
@@ -302,17 +305,26 @@ Target configuration secrets are never stored here.
 
 ### `source:backoff`
 
-Stores AIHOT source rate-limit/backoff state separately from committed source metadata:
+Stores source retry state separately from committed source metadata:
 
 ```json
 {
+  "attemptCount": 2,
   "retryNotBefore": "...",
-  "reason": "429",
+  "lastStatus": 503,
+  "lastFailureAt": "...",
+  "reason": "upstream_5xx",
   "updatedAt": "..."
 }
 ```
 
-A source backoff record must be checked before any AIHOT fetch, including `/latest`.
+Rules:
+
+- Check this key before **every** AIHOT fetch, including `/latest`.
+- A valid `Retry-After` sets `retryNotBefore` directly according to the upstream instruction.
+- Without `Retry-After`, source failures use deterministic exponential backoff: `5m → 10m → 20m → 40m → 80m → 160m → 320m → 6h`, capped at 6 hours.
+- Successful `200` or `304` resets the source-failure counter and removes or neutralizes expired source backoff state.
+- Source backoff is independent from notification-target retry state.
 
 ### `manual:latest`
 
@@ -333,7 +345,7 @@ Rules:
 
 ### `diag:last`
 
-Stores sanitized operational diagnostics such as Cron timestamps, source-check result, pending/retry counts, and last notification result. It must not contain secrets.
+Stores sanitized operational diagnostics such as Cron timestamps, source-check result, pending/retry counts, receipt-review anchoring warnings, legacy-migration warnings, and last notification result. It must not contain secrets.
 
 ### No hot pending index
 
@@ -353,19 +365,65 @@ post:<post.id>
 
 ### Receipt-review signal
 
-Stable identifier:
+A receipt-review candidate exists when:
 
 ```text
-receipt_review:<event.id>
+event.status == "confirmed"
+&& event.confirmationBasis == "receipt_review"
 ```
 
-V1 treats one AIHOT event's `receipt_review` confirmation as a single logical signal. If the same event is later retracted and reconfirmed under the same event ID, V1 does not emit a second receipt-review notification. A future version may model confirmation epochs if AIHOT exposes a stronger lifecycle contract.
+V1 does **not** use `event.id` alone as the durable receipt-review dedupe identity because the public API contract does not guarantee that an event ID remains the same logical identity across every future regrouping/correction.
+
+#### Exact anchor algorithm
+
+1. Collect the event's source posts with valid `post.id` and valid `publishedAt`.
+2. Sort them by `(publishedAt, post.id)` ascending.
+3. The first post becomes `anchorPostId`.
+4. The canonical signal ID is:
+
+```text
+receipt_review:<event.type>:<anchorPostId>
+```
+
+5. Persist all source-post IDs observed in that event as `receiptAnchorPostIds` inside the immutable signal.
+
+Before creating a new receipt-review signal, the detector must also inspect existing receipt-review signals for the same `event.type`. If an existing signal's `receiptAnchorPostIds` intersects the current event's source-post IDs, treat the current candidate as the same logical receipt-review confirmation and do not emit a duplicate even if regrouping changed the canonical first post.
+
+If a receipt-review event has **no valid source post to anchor to**, V1 does not automatically notify it. Record a sanitized `unanchored_receipt_review` diagnostic and wait for a later snapshot that provides an anchor or a future upstream contract that supplies a stronger durable identity. This conservative rule avoids inventing a dedupe identity from mutable event metadata.
+
+If a previously anchored receipt-review event is later corrected, withdrawn, or regrouped:
+
+- existing sent receipt-review signals are not retroactively retracted from notification targets;
+- a later confirmed snapshot is not re-notified when source-post overlap links it to an existing receipt signal;
+- if no source-post overlap survives, V1 cannot prove logical continuity and treats the candidate according to the normal anchor algorithm, while recording sanitized correction/regrouping diagnostics when detectable.
+
+#### Receipt-review notification payload
+
+Receipt-review notifications use a dedicated normalized payload rather than pretending a new source post exists:
+
+```json
+{
+  "kind": "receipt_review",
+  "eventType": "direct_reset",
+  "eventStatus": "confirmed",
+  "title": "...",
+  "scope": "...",
+  "occurredOn": "...",
+  "confirmationBasis": "receipt_review",
+  "observedAt": "<snapshot.checkedAt>",
+  "content": "AIHOT 已通过 receipt review 确认该 Codex 重置事件。",
+  "sourceUrl": null,
+  "aihotUrl": "<event.url>"
+}
+```
+
+`publishedAt` is not invented for receipt-review signals. Their `sortAt` uses the ordering rule in section 10.
 
 ### Canonical notification payload
 
 Business logic creates plain structured data. It does not embed platform-specific Markdown or HTML.
 
-Conceptual shape:
+Conceptual source-post shape:
 
 ```json
 {
@@ -385,7 +443,7 @@ Conceptual shape:
 }
 ```
 
-This payload is persisted inside the signal before automatic dispatch. The manual `/latest` route builds the same canonical structure from its freshly fetched AIHOT snapshot but does not create or mutate automatic signal/delivery state.
+This payload is persisted inside the signal before automatic dispatch. The manual `/latest` route builds the same source-post canonical structure from its freshly fetched AIHOT snapshot but does not create or mutate automatic signal/delivery state.
 
 ## 8. Snapshot validation and watermark algorithm
 
@@ -474,7 +532,7 @@ Rules:
 
 - If validation fails, do not update `meta:v4`.
 - If any required new signal write fails before the source commit, do not update `meta:v4`.
-- Partially written signal keys are safe: a later retry deduplicates by stable `signalId`.
+- Partially written signal keys are safe: a later retry deduplicates by stable `signalId` and receipt-review overlap rules.
 - Never save a new ETag after an incompatible schema or failed pre-commit persistence step.
 - Only the final `meta:v4` write commits the accepted automatic snapshot boundary.
 - A later `304` is safe because retryable notification payloads are already stored inside `signal:*` keys.
@@ -482,7 +540,7 @@ Rules:
 
 ## 10. Signal ordering
 
-New source-post signals from one snapshot are sent in deterministic chronological order:
+New signals from one snapshot are sent in deterministic chronological order:
 
 ```text
 (sortAt, signalId) ascending
@@ -500,7 +558,7 @@ For receipt-review signals:
 sortAt = event.confirmedAt || event.updatedAt || snapshot.checkedAt
 ```
 
-This prevents a newer confirmation from being sent before an older announcement merely because AIHOT's snapshot is newest-first.
+This prevents a newer confirmation from being scheduled before an older announcement merely because AIHOT's snapshot is newest-first.
 
 Per-target delivery order is best-effort across separate Cron invocations; V1 guarantees deterministic scheduling order inside one invocation but does not claim globally transactional ordering across independent external platforms.
 
@@ -572,7 +630,17 @@ If the same target is later re-enabled, it only appears in `targetIds` of signal
 
 Changing the target secret changes its hash and therefore creates a new target identity.
 
-## 12. Delivery retry policy
+## 12. Delivery semantics and retry policy
+
+### Delivery guarantee
+
+V1 provides **at-least-once** delivery semantics, not exactly-once delivery.
+
+Expected guarantee:
+
+> A durable signal is eventually delivered at least once to each eligible active target, subject to retry limits and permanent failures. After a successful delivery has been durably recorded as `sent`, the relay does not intentionally resend that signal to the same target.
+
+There is an unavoidable crash window: an external platform may accept a message successfully and the Worker may crash before persisting `delivery:... = sent`. On recovery, that target can receive a duplicate because most webhook platforms do not provide a usable idempotency key. The project must document this possibility rather than claiming exactly-once delivery.
 
 ### Retryable failures
 
@@ -628,11 +696,12 @@ Execution order:
 3. Check `source:backoff` before attempting AIHOT.
 4. If upstream backoff has expired or is absent, perform the AIHOT conditional request.
 5. Handle AIHOT:
-   - `304` → no new source commit required.
-   - `200` → validate, classify against immutable W0, persist signals, then commit `meta:v4`.
-   - `429` → persist `source:backoff`; do not immediately retry.
-   - `5xx` / network failure → preserve committed source state.
-   - incompatible/invalid snapshot → preserve committed source state.
+   - `304` → reset source-failure count; no new source commit required.
+   - `200` → validate, classify against immutable W0, persist signals, commit `meta:v4`, and reset source-failure count.
+   - `429` → persist source backoff using `Retry-After` when present; do not immediately retry.
+   - `503` / other `5xx` → use `Retry-After` when present, otherwise persist exponential source backoff; preserve committed source state.
+   - network failure / timeout → persist exponential source backoff; preserve committed source state.
+   - incompatible/invalid snapshot → preserve committed source state; do not advance ETag/watermark.
 6. Build the eligible delivery queue from newly created signals plus durable retry backlog.
 7. Sort by signal chronology and respect `nextAttemptAt`.
 8. Dispatch up to the per-run delivery budget.
@@ -700,6 +769,16 @@ AIHOT → Worker validation → latest-post selection → notification adapters 
 
 The route remains `GET` so the complete authenticated URL can be saved as a browser bookmark or added to a phone home screen.
 
+#### No-side-effect request guards
+
+Before authentication or any external request:
+
+- `HEAD /latest` must never trigger AIHOT or notification traffic; return `405 Method Not Allowed` with `Allow: GET`.
+- A request whose `Sec-Purpose` or legacy `Purpose` header indicates `prefetch` or `prerender` must not trigger side effects; return `204 No Content` (or an equivalent sanitized no-side-effect response).
+- These guards exist to prevent browser speculative loading, link scanners, or preview systems from firing a side-effecting bookmarked GET.
+
+Only a real `GET` continues to authentication.
+
 #### Authentication
 
 The caller must provide:
@@ -711,7 +790,7 @@ GET /latest?key=<LATEST_ACCESS_KEY>
 Security rules:
 
 1. `LATEST_ACCESS_KEY` is required; there is no unauthenticated fallback.
-2. The key must be validated before reading notification targets, checking source data, or making any external request.
+2. For a real GET, the key must be validated before reading notification targets, checking source data, or making any external request.
 3. Missing or incorrect keys return `403` immediately.
 4. Authentication failure must never trigger an AIHOT request or notification request.
 5. The implementation must never log the provided key, raw query string, or complete request URL.
@@ -727,7 +806,7 @@ After authentication and **before fetching AIHOT**:
 1. Check `manual:latest`.
 2. If the last accepted manual call was less than 10 seconds ago, return a sanitized cooldown response and do not call AIHOT or any notification target.
 3. Check `source:backoff`.
-4. If an AIHOT `Retry-After` / source backoff window is active, return a sanitized backoff response and do not call AIHOT.
+4. If source backoff is active — whether created from `429`, `Retry-After`, `5xx`, network failure, or timeout — return a sanitized backoff response and do not call AIHOT.
 5. Only after these checks may `/latest` fetch AIHOT.
 
 The 10-second cooldown is best-effort duplicate protection, not the primary security boundary. The high-entropy access key is the primary authorization boundary.
@@ -740,7 +819,7 @@ For an accepted call:
 2. Validate the snapshot using the same schema and safety rules as the automatic path.
 3. Traverse every event and source post.
 4. Select the globally newest source post by `posts[].publishedAt`; never use `events[0]` as a latest-post shortcut.
-5. Build the same canonical notification model used by automatic signals.
+5. Build the same source-post canonical notification model used by automatic signals.
 6. Send it once to every currently configured target.
 7. Return sanitized per-channel/target results.
 8. Do not create automatic signals, modify automatic delivery keys, or advance the automatic ETag/watermark.
@@ -767,17 +846,20 @@ Return `404`.
 
 Existing deployments may contain earlier monolithic state formats.
 
+V3 and earlier did not persist the complete immutable notification payload, target snapshot, and per-target delivery state required by V4. Therefore V1 chooses an explicit **baseline migration**, not a lossy guess at in-flight retry reconstruction.
+
 When `stateVersion !== 4` or no valid V4 commit exists:
 
-1. Fetch a complete AIHOT snapshot without trusting an incompatible old ETag.
-2. Validate the snapshot fully.
+1. Do not trust an incompatible old ETag.
+2. Fetch and fully validate a complete AIHOT snapshot.
 3. Build the boundary watermark from all current source posts.
-4. Record current `receipt_review:<event.id>` signals as baseline-known without notification.
-5. Commit `meta:v4` only after baseline preparation succeeds.
-6. Do not send historical notifications.
+4. Treat currently anchored receipt-review confirmations as baseline-known without sending notifications.
+5. Do not create historical source-post or receipt-review delivery work.
+6. Commit `meta:v4` only after baseline preparation succeeds.
 7. Record migration diagnostics as `migrated`.
+8. If legacy state indicates old pending/in-flight delivery intent that cannot be represented losslessly as a V4 immutable signal plus target snapshot, **intentionally abandon that legacy retry intent** and record a sanitized `legacy_pending_abandoned` diagnostic.
 
-Migration must not create signal/delivery work for historical source posts.
+The migration policy prioritizes avoiding historical floods and malformed retry reconstruction over preserving incomplete legacy retry intent. README upgrade notes must state this explicitly and recommend invoking authenticated `/latest` once after upgrade to verify the complete AIHOT → Worker → notification path.
 
 ## 17. Retention and cleanup
 
@@ -802,16 +884,18 @@ Store concise sanitized diagnostics, including:
 - last Cron start/end;
 - last source status;
 - last source HTTP/result category;
-- current source backoff deadline if any;
+- current source backoff deadline and consecutive failure count when applicable;
 - latest committed source time;
 - number of active targets;
 - pending/retry/permanent-failure counts;
+- receipt-review anchoring/correction warnings;
+- migration warnings such as `legacy_pending_abandoned`;
 - last successful notification time;
 - sanitized last errors.
 
 Never persist full secrets in logs, KV values, errors, or HTTP responses.
 
-For `/latest`, logs and diagnostics may record only sanitized facts such as route name, authentication success/failure category, cooldown/backoff category, and aggregate delivery result. They must not include the access key, raw query string, or full request URL.
+For `/latest`, logs and diagnostics may record only sanitized facts such as route name, authentication success/failure category, speculative-request rejection, cooldown/backoff category, and aggregate delivery result. They must not include the access key, raw query string, or full request URL.
 
 ## 19. Testing strategy
 
@@ -828,7 +912,11 @@ Mandatory tests:
 - historical backfill `< watermark` is not notified;
 - conflicting duplicate `post.id` invalidates the snapshot;
 - incompatible `schemaVersion` does not advance ETag/watermark;
-- receipt-review signal ID is exactly `receipt_review:<event.id>`.
+- receipt-review anchor selects the earliest valid source post by `(publishedAt, post.id)`;
+- receipt-review signal ID is exactly `receipt_review:<event.type>:<anchorPostId>`;
+- receipt-review regrouping with overlapping source-post IDs does not create a duplicate signal;
+- unanchored receipt-review produces diagnostics but no automatic notification;
+- receipt-review payload has `observedAt`, `sourceUrl: null`, and does not invent `publishedAt`.
 
 ### Commit-protocol tests
 
@@ -839,6 +927,16 @@ Mandatory tests:
 - partially persisted stable signals are deduplicated on the next full fetch;
 - `304` still allows pending delivery from persisted canonical payload;
 - no code path requires two rapid writes to one monolithic state key.
+
+### Source-backoff tests
+
+Mandatory tests:
+
+- `429` with `Retry-After` blocks Cron and `/latest` until the deadline;
+- `503` with `Retry-After` is handled the same way;
+- `5xx` without `Retry-After` advances deterministic exponential source backoff;
+- network failure and timeout advance source backoff;
+- `200` and `304` reset the consecutive source-failure counter.
 
 ### Delivery tests
 
@@ -852,7 +950,8 @@ Mandatory tests:
 - disabled targets do not remain pending;
 - re-enabled targets do not receive historical signals;
 - per-run delivery budget is enforced;
-- source polling is not starved by backlog.
+- source polling is not starved by backlog;
+- once `sent` is durably recorded, the relay does not intentionally resend that signal/target pair.
 
 ### Adapter safety tests
 
@@ -877,10 +976,12 @@ Mock `fetch()` and verify:
 Mandatory tests:
 
 - `/` and `/health` never expose secrets or target hashes;
+- `HEAD /latest` never performs external requests;
+- prefetch/prerender `/latest` never performs external requests;
 - `/latest` without a key returns `403` before any external request;
 - `/latest` with a wrong key returns `403` before any external request;
 - authenticated `/latest` checks the 10-second cooldown before AIHOT;
-- authenticated `/latest` obeys `source:backoff` before AIHOT;
+- authenticated `/latest` obeys all active `source:backoff` before AIHOT;
 - accepted `/latest` performs a fresh AIHOT fetch;
 - `/latest` selects the real newest source post by `publishedAt`;
 - `/latest` sends the fresh result to currently configured targets;
@@ -888,6 +989,15 @@ Mandatory tests:
 - `/latest` responses include `no-store`, `no-referrer`, and `noindex` protections;
 - logs never contain the raw access key or complete query URL;
 - unknown routes return 404.
+
+### Migration tests
+
+Mandatory tests:
+
+- V3→V4 migration never replays historical notifications;
+- incompatible old ETag is not reused;
+- legacy retry intent that cannot be represented losslessly is abandoned explicitly and emits `legacy_pending_abandoned` diagnostics;
+- post-migration `/latest` can still verify the full path independently of automatic delivery state.
 
 ## 20. CI
 
@@ -916,6 +1026,9 @@ Provide:
 - A mobile-friendly `/latest?key=...` bookmark example.
 - Explicit warning that the bookmarked URL itself contains a secret and must not be shared.
 - Access-key rotation guidance.
+- Explanation that HEAD/prefetch/prerender requests do not execute `/latest` side effects.
+- V3→V4 upgrade note explaining that incomplete legacy pending retries are intentionally abandoned rather than guessed.
+- At-least-once delivery semantics and the possible crash-window duplicate.
 - Troubleshooting/FAQ.
 - AIHOT attribution and API/data-usage statement.
 - Security guidance: never commit real webhook URLs, bot tokens, `.env`, `.dev.vars`, or `LATEST_ACCESS_KEY`.
@@ -933,32 +1046,36 @@ README must describe the project as an independent community project, not an off
 - Treat all upstream AIHOT-rendered text as untrusted content.
 - Generic Webhook templates use structured substitution.
 - `/latest` always requires a high-entropy `LATEST_ACCESS_KEY`; there is no unauthenticated mode.
-- `/latest` validates authorization, cooldown, and source backoff before any AIHOT or notification fetch.
+- `HEAD`, prefetch, and prerender requests to `/latest` must never cause side effects.
+- Real `/latest` GET requests validate authorization, cooldown, and source backoff before any AIHOT or notification fetch.
 - `/latest` never logs the raw query string, complete request URL, or access key.
 - `/latest` responses are non-cacheable and suppress referrer leakage.
-- A source `Retry-After` deadline is checked before every AIHOT fetch, including manual `/latest`.
+- Source backoff created by `Retry-After`, `5xx`, network failure, or timeout is checked before every AIHOT fetch, including manual `/latest`.
 
 ## 23. Success criteria for V1
 
 V1 is complete when:
 
-1. A new AIHOT Codex source post is discovered and delivered once to each active target.
-2. Multiple new posts in one snapshot are all classified against the same immutable W0 and none are lost because of iteration order.
-3. Same-timestamp source posts are deduplicated by the boundary ID set even after old signal pruning.
-4. A `receipt_review` confirmation without a new source post can produce one stable signal.
-5. Historical AIHOT backfills do not create false fresh alerts.
-6. Newly detected signals with complete canonical payloads are durable before ETag/watermark advances.
-7. AIHOT `304` responses do not prevent pending delivery retries.
-8. Partial target failures do not resend successful targets.
-9. Retryable failures back off; invalid credentials do not retry forever.
-10. Notification backlog cannot starve source monitoring.
-11. Removed/re-added targets do not receive unintended historical replay.
-12. External text cannot inject platform markup, mass mentions, unsafe URLs, or malformed Generic Webhook JSON.
-13. No public HTTP route exposes credentials or target secret hashes.
-14. A bookmarked authenticated `GET /latest` provides a one-tap mobile full-path test while unauthenticated requests cannot trigger AIHOT or notification traffic.
-15. `/latest` respects accidental-repeat cooldown and upstream `Retry-After` before fetching AIHOT.
-16. V4 migration does not replay historical notifications.
-17. README clearly credits AIHOT and explains the independent code-license/API-use boundary.
+1. A durable new AIHOT Codex source-post signal is eventually delivered at least once to each eligible active target unless that target reaches a documented terminal failure; after `sent` is durably recorded, that signal/target pair is not intentionally resent.
+2. The documentation explicitly acknowledges the unavoidable crash window in which an external send may succeed before its durable acknowledgement and therefore may be duplicated on recovery.
+3. Multiple new posts in one snapshot are all classified against the same immutable W0 and none are lost because of iteration order.
+4. Same-timestamp source posts are deduplicated by the boundary ID set even after old signal pruning.
+5. An anchored `receipt_review` confirmation without a new confirmation source post can produce one stable signal, while unanchored receipt reviews are diagnosed and not guessed.
+6. Receipt-review regrouping with overlapping source-post anchors does not create duplicate confirmation notifications.
+7. Historical AIHOT backfills do not create false fresh alerts.
+8. Newly detected signals with complete canonical payloads are durable before ETag/watermark advances.
+9. AIHOT `304` responses do not prevent pending delivery retries.
+10. Partial target failures do not intentionally resend targets already durably marked `sent`.
+11. Retryable target failures back off; invalid credentials do not retry forever.
+12. Source `429`, `503`, other `5xx`, network errors, and timeouts establish deterministic backoff that Cron and `/latest` both obey.
+13. Notification backlog cannot starve source monitoring.
+14. Removed/re-added targets do not receive unintended historical replay.
+15. External text cannot inject platform markup, mass mentions, unsafe URLs, or malformed Generic Webhook JSON.
+16. No public HTTP route exposes credentials or target secret hashes.
+17. A bookmarked authenticated `GET /latest` provides a one-tap mobile full-path test while unauthenticated, HEAD, prefetch, and prerender requests cannot trigger AIHOT or notification traffic.
+18. `/latest` respects accidental-repeat cooldown and all source backoff before fetching AIHOT.
+19. V3→V4 migration does not replay history and explicitly abandons unreconstructable legacy pending work rather than silently guessing.
+20. README clearly credits AIHOT and explains the independent code-license/API-use boundary.
 
 ## 24. Future extensions
 
