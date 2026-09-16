@@ -1,16 +1,14 @@
 # AIHOT Codex Reset Relay — Design Specification
 
 Date: 2026-09-16
-Status: Draft — pending user review
+Status: **Approved — implementation ready**
 Repository: `LewLIu/aihot-codex-reset-relay`
 
 ## 1. Purpose
 
 AIHOT Codex Reset Relay is a self-hosted Cloudflare Workers project that monitors AIHOT's public Codex Reset API and relays new Codex reset information to user-configured notification channels.
 
-The project does **not** collect posts from X/Twitter, independently determine whether a Codex reset happened, mirror AIHOT's API, or provide a hosted SaaS service. AIHOT is the upstream source of structured Codex Reset data; this project is responsible for polling, validation, state tracking, deduplication, retryable delivery, and channel-specific notification formatting.
-
-Primary data flow:
+The project does **not** scrape X/Twitter, independently decide whether a reset happened, mirror AIHOT's API, or provide hosted SaaS. AIHOT is the upstream structured-data source; this project is responsible for polling, validation, state tracking, deduplication, retryable delivery, and channel-specific formatting.
 
 ```text
 Tibo / upstream sources
@@ -31,110 +29,69 @@ WeCom / Feishu / DingTalk / Telegram / Bark / ntfy / Slack / Generic Webhook
 - Monitor `https://aihot.news/api/v1/codex-resets`.
 - Poll every 30 minutes using a Cloudflare Cron Trigger.
 - Use ETag / `If-None-Match` conditional requests.
-- Respect AIHOT rate limiting and upstream backoff, including `Retry-After` where present.
-- Detect new source posts using `posts[].id`.
-- Use `posts[].publishedAt` as the source-post chronology boundary.
-- Detect anchored `receipt_review` confirmations even when no new confirmation source post exists.
-- Ignore historical backfills or regrouped old posts instead of notifying them as fresh events.
-- Persist immutable signals and per-target delivery outcomes in Cloudflare Workers KV.
-- Retry only retryable failed delivery targets, with backoff and a per-run delivery budget.
-- Provide an authenticated `GET /latest` operator endpoint that performs a fresh AIHOT fetch and sends the real latest source post to configured notification targets.
-- Keep `/latest` convenient for mobile use by allowing the authenticated URL to be bookmarked directly.
-- Support multiple notification channels and multiple targets per channel.
-- Bound outbound delivery concurrency while preserving per-target signal ordering.
-- Provide public status and health endpoints without exposing secrets.
-- Include automated tests and GitHub Actions CI.
+- Respect AIHOT `Retry-After` and exponential source backoff.
+- Detect source posts using stable `posts[].id`.
+- Use `posts[].publishedAt` as source chronology.
+- Detect anchored `receipt_review` confirmations even without a new confirmation post.
+- Suppress historical backfills/regrouped old posts.
+- Persist immutable signals and per-target delivery outcomes in Workers KV.
+- Retry retryable failures with bounded attempts, backoff, and per-run budget.
+- Provide authenticated, mobile-friendly `GET /latest` that performs a fresh AIHOT fetch and sends the real latest source post.
+- Support multiple targets per notification channel.
+- Bound outbound concurrency while preserving per-target signal ordering.
+- Expose sanitized status and health endpoints.
+- Provide automated tests and GitHub Actions CI.
 
 ### Out of scope for V1
 
-- Scraping X/Twitter directly.
-- Independently judging whether a Codex reset is true.
-- Mirroring or proxying the AIHOT API.
-- Bulk redistribution of AIHOT historical data.
-- A hosted SaaS version.
-- User accounts or a general authentication system.
-- Admin dashboard UI.
-- Database services other than Workers KV.
+- X/Twitter scraping.
+- Independent reset truth determination.
+- AIHOT API proxy/mirror or bulk history redistribution.
+- Hosted SaaS, user accounts, admin UI.
+- Databases other than Workers KV.
 - Durable Objects.
 - Email delivery.
 - Automatic Cloudflare deployment from GitHub Actions.
-- A public unauthenticated endpoint that triggers notifications or AIHOT fetches.
-- Distributed exactly-once delivery guarantees across Cloudflare locations.
+- Unauthenticated side-effecting routes.
+- Distributed exactly-once delivery guarantees.
 
 ## 3. AIHOT attribution, API rules, and licensing boundary
 
-The repository source code will use the **MIT License**.
+Repository code uses the **MIT License**. MIT covers only code authored for this repository; it does not grant rights to AIHOT APIs/data/content or third-party source content.
 
-The MIT License applies only to code authored for this repository. It does not grant rights to AIHOT APIs, AIHOT data, AIHOT content, or third-party source content.
+README documentation MUST state that this is an independent community project, not an official AIHOT project; credit AIHOT for Codex Reset aggregation, structuring, translations, and public API; and explain that users remain responsible for AIHOT's current API/data-use rules. Attribution does not itself grant commercial or redistribution permission.
 
-README documentation must clearly state:
+The client MUST behave respectfully:
 
-- This is an independent community project and is not an official AIHOT project.
-- The project is powered by AIHOT's public Codex Reset API.
-- AIHOT must be credited for the Codex Reset event aggregation, structuring, translations, and public API used by this project.
-- Users remain responsible for complying with AIHOT's current API and data usage rules.
-- AIHOT's current public rules allow personal non-commercial use, non-commercial public-interest use, and internal organizational use; external commercial products, paid services, client delivery, proxy APIs, data resale, public mirrors, or bulk redistribution require AIHOT authorization.
-- Attribution alone does not constitute commercial or redistribution authorization.
-- Third-party source content remains subject to the rights of its original sources.
+- default polling interval: 30 minutes;
+- conditional GET via ETag;
+- no aggressive retry loops;
+- any valid `Retry-After` establishes source backoff shared by Cron and `/latest`;
+- `429` uses `Retry-After` when present;
+- `503`/other upstream failures use `Retry-After` when present, otherwise deterministic exponential backoff;
+- successful `200` or `304` resets the consecutive source-failure counter;
+- schema, parsing, validation, or pre-commit persistence failure MUST NOT advance source commit state.
 
-The implementation must behave as a respectful API client:
-
-- Default polling interval: 30 minutes.
-- Conditional GET via ETag.
-- No concurrent retry storm.
-- Any response that carries a valid `Retry-After` must establish a source backoff deadline that Cron and `/latest` both obey before any further AIHOT fetch.
-- `429` always uses `Retry-After` when present.
-- `503` and other upstream failures use `Retry-After` when present; otherwise `5xx` and network failures use exponential source backoff.
-- Successful `200` or `304` resets the consecutive source-failure counter and clears expired failure backoff state.
-- Never advance source commit state after schema validation, persistence, or parsing failure.
-
-## 4. AIHOT API semantics used by the project
+## 4. AIHOT API semantics
 
 V1 expects `schemaVersion === 1`.
 
-Relevant top-level fields:
+Top-level fields used: `schemaVersion`, `timezone`, `checkedAt`, `historyFrom`, `count`, `events`.
 
-- `schemaVersion`: API schema version.
-- `timezone`: API timezone metadata.
-- `checkedAt`: latest successful AIHOT source verification time.
-- `historyFrom`: beginning of the provided history window.
-- `count`: event count.
-- `events`: full event snapshot.
+Important event fields: `id`, `type`, `label`, `status`, `title`, `scope`, `createdAt`, `updatedAt`, `confirmedAt`, `occurredOn`, `confirmationBasis`, `schedule`, `posts`, `url`.
 
-Important event fields:
+Important post fields: `id`, `publishedAt`, `stage`, `text`, `originalText`, `url`.
 
-- `id`: AIHOT event identifier. V1 does **not** assume this is a permanent logical-event identity across all future regrouping/correction behavior.
-- `type`: e.g. `direct_reset` or `reset_credit`.
-- `label`: display label.
-- `status`: e.g. `announced` or `confirmed`.
-- `title`: AIHOT event title.
-- `scope`: affected scope.
-- `createdAt`: event record timestamp.
-- `updatedAt`: AIHOT event-record update timestamp.
-- `confirmedAt`: earliest confirmation-post time, not necessarily actual delivery/reset execution time.
-- `occurredOn`: independently verified Beijing-time occurrence date when known.
-- `confirmationBasis`: `source_post`, `receipt_review`, or null.
-- `schedule`: original announced schedule metadata.
-- `posts`: source-post list for the event.
-- `url`: AIHOT event URL.
+Normative rules:
 
-Important source-post fields:
+- `events[0]` MUST NOT be treated as the newest source message; events are ordered by `event.updatedAt`.
+- Global latest source post is selected by comparing every `posts[].publishedAt` across all events.
+- `event.id` is not assumed to remain the same logical identity across every future regrouping/correction.
+- `post.id` is the stable identity used for source-post dedupe and receipt anchoring.
 
-- `id`: stable source-post identifier used by this project for source-post deduplication and receipt-review anchoring.
-- `publishedAt`: actual source-post publication time.
-- `stage`: stage represented by that source post.
-- `text`: AIHOT Chinese translation.
-- `originalText`: relevant original-language excerpt.
-- `url`: original source-post URL.
+## 5. Architecture and repository structure
 
-Critical ordering rule:
-
-- `events[0]` must never be assumed to be the newest Tibo/source message because events are ordered by `event.updatedAt`.
-- When selecting the globally newest source post, compare all `posts[].publishedAt` values across all events.
-
-## 5. Architecture
-
-Use a lightweight modular Adapter architecture.
+Use a lightweight modular Adapter architecture:
 
 ```text
 Cloudflare Worker entry
@@ -162,7 +119,7 @@ Cloudflare Worker entry
    WeCom   Feishu   Telegram ...
 ```
 
-Recommended source layout:
+Expected source layout:
 
 ```text
 src/
@@ -193,30 +150,15 @@ src/
     └── time.js
 ```
 
-Supporting repository structure:
+Supporting files: `test/`, `wrangler.jsonc`, `package.json`, `.gitignore`, `README.md`, `README_EN.md`, `LICENSE`.
 
-```text
-test/
-docs/
-wrangler.jsonc
-package.json
-.gitignore
-README.md
-README_EN.md
-LICENSE
-```
+## 6. Workers KV persistence model
 
-## 6. KV persistence model
-
-Do **not** store the whole application state in one frequently rewritten JSON key. Workers KV is not a transactional read-modify-write database, and a design that repeatedly rewrites one hot key is incompatible with its write semantics.
-
-V1 uses separate keys with one clear responsibility each.
+Do **not** store the whole application state in one frequently rewritten JSON key. V1 uses separate keys with one responsibility each.
 
 ### `meta:v4`
 
-This is the committed source snapshot boundary. It is written only after all newly detected signals for a validated snapshot have been durably persisted.
-
-Conceptual value:
+Committed source snapshot boundary:
 
 ```json
 {
@@ -231,11 +173,11 @@ Conceptual value:
 }
 ```
 
+It is written only after all newly detected signals for the validated snapshot are durably persisted.
+
 ### `signal:<signalId>`
 
-Signals are immutable durable work items.
-
-Conceptual source-post value:
+Immutable durable work item containing complete canonical notification payload and the target snapshot active at discovery time.
 
 ```json
 {
@@ -253,29 +195,22 @@ Conceptual source-post value:
     "sourceUrl": "https://...",
     "aihotUrl": "https://aihot.news/..."
   },
-  "targetIds": [
-    "wework:0123456789abcdef0123456789abcdef",
-    "telegram:fedcba9876543210fedcba9876543210"
-  ]
+  "targetIds": ["wework:<hash>", "telegram:<hash>"]
 }
 ```
 
-A signal must contain the complete canonical notification payload required for future delivery. This is required so pending deliveries remain retryable even when a later AIHOT request returns `304` or the upstream source is temporarily unavailable.
-
-Receipt-review signals additionally persist their anchoring metadata, including the canonical anchor post ID and the source-post IDs observed in the event at creation time.
+Receipt-review signals additionally persist `anchorPostId` and `receiptAnchorPostIds`.
 
 ### `delivery:<signalId>:<targetId>`
 
-No delivery key means the target has not yet been attempted and is pending.
-
-When a delivery key exists, its status is one of:
+**Missing key means pending/not yet attempted.** Existing statuses:
 
 - `sent`
 - `retry_wait`
 - `permanent_failure`
 - `disabled`
 
-Conceptual retry value:
+Retry example:
 
 ```json
 {
@@ -288,11 +223,9 @@ Conceptual retry value:
 }
 ```
 
-A successful target is written as `sent`. A removed target is written as `disabled` for old signals instead of remaining pending forever.
-
 ### `target:<targetId>`
 
-Stores non-secret lifecycle metadata for a configured target:
+Non-secret lifecycle metadata only:
 
 ```json
 {
@@ -303,11 +236,7 @@ Stores non-secret lifecycle metadata for a configured target:
 }
 ```
 
-Target configuration secrets are never stored here.
-
 ### `source:backoff`
-
-Stores source retry state separately from committed source metadata:
 
 ```json
 {
@@ -322,57 +251,59 @@ Stores source retry state separately from committed source metadata:
 
 Rules:
 
-- Check this key before **every** AIHOT fetch, including `/latest`.
-- A valid `Retry-After` sets `retryNotBefore` directly according to the upstream instruction.
-- Without `Retry-After`, source failures use deterministic exponential backoff: `5m → 10m → 20m → 40m → 80m → 160m → 320m → 6h`, capped at 6 hours.
-- Successful `200` or `304` resets the source-failure counter and removes or neutralizes expired source backoff state.
-- Source backoff is independent from notification-target retry state.
+- checked before **every** AIHOT fetch, including `/latest`;
+- valid `Retry-After` directly sets `retryNotBefore`;
+- without it: `5m → 10m → 20m → 40m → 80m → 160m → 320m → 6h`, capped at 6h;
+- successful `200`/`304` resets consecutive source failures.
 
 ### `manual:latest`
 
-Stores only best-effort accidental-repeat protection for the authenticated manual route:
+Best-effort accidental-repeat protection:
 
 ```json
-{
-  "lastAcceptedAt": "..."
-}
+{ "lastAcceptedAt": "..." }
 ```
 
-Rules:
-
-- `/latest` checks this cooldown record **after authentication but before any AIHOT fetch**.
-- If the previous accepted invocation was less than 10 seconds ago, return a sanitized duplicate/cooldown response and do not call AIHOT or notification targets.
-- This record is not an authentication mechanism and is not relied upon for abuse prevention.
-- Workers KV is eventually consistent, so the cooldown is best-effort and intended to absorb double taps, browser refreshes, and preview reloads.
+It is not authentication. `/latest` checks it after authentication and before AIHOT; calls within 10 seconds are rejected without external requests.
 
 ### `diag:last`
 
-Stores sanitized operational diagnostics such as Cron timestamps, source-check result, pending/retry counts, receipt-review anchoring warnings, legacy-migration warnings, and last notification result. It must not contain secrets.
+Sanitized operational diagnostics only. No secrets.
 
 ### No hot pending index
 
-V1 does not maintain a frequently rewritten `pending:index` key. Codex Reset event volume is low, so the Worker may enumerate `signal:` keys using KV listing and inspect their delivery keys. Pagination must be supported.
+V1 does not maintain `pending:index`. Low event volume permits paginated `KV.list({ prefix: "signal:" })` during later-run recovery/retry. Newly created in-memory signals are dispatched directly after commit; the same invocation MUST NOT rely on KV listing immediately reflecting its writes.
 
-The current invocation must not depend on KV listing immediately reflecting writes from the same invocation; newly created in-memory candidate signals are dispatched directly after commit. KV listing is for later-run recovery/retry.
+### Physical KV write invariants
+
+These are implementation requirements, not suggestions:
+
+1. `signal:*` records are immutable and are written at most once for a logical signal.
+2. A `delivery:*` key MUST NOT be pre-created merely to represent `pending`; missing delivery key is the pending state.
+3. After an external delivery attempt finishes, create/update only that signal-target pair's `delivery:*` key with `sent`, `retry_wait`, `permanent_failure`, or `disabled`.
+4. Retry updates to an existing `delivery:*` key occur only after `nextAttemptAt` is eligible; retry intervals are minutes/hours, never sub-second.
+5. `meta:v4` is committed at most once for one accepted source snapshot.
+6. `diag:last` is written once at the end of one invocation.
+7. `target:*`, `source:backoff`, and `manual:latest` are independent keys; no implementation may collapse them with `meta`, `signal`, or `delivery` into one frequently rewritten shared state key.
+8. The implementation MUST NOT add artificial `sleep(1000)` delays to work around KV same-key write limits; key separation is the required solution.
+9. Per-target outcome persistence MUST NOT be implemented as repeated rewrites of a shared aggregate state object.
 
 ### Eventual consistency boundary
 
-Workers KV is eventually consistent across locations. V1 therefore does not use KV as a distributed lock or claim that two overlapping Worker executions can observe each other's just-written delivery state immediately.
+Workers KV is eventually consistent across locations. V1 does not use KV as a distributed lock or claim exactly-once coordination.
 
 Consequences:
 
-- stable immutable `signalId` values remain the source of logical deduplication;
-- a stale read by an overlapping execution can still cause the same target to be sent the same signal twice before the `sent` delivery record becomes visible;
-- metadata such as `meta:v4` may be observed stale by another location for a short period;
-- the design prioritizes avoiding silent data loss over pretending that KV can provide distributed exactly-once coordination.
+- stable immutable signal IDs provide logical dedupe;
+- overlapping executions may briefly read stale delivery state and duplicate a send;
+- another location may briefly observe stale `meta:v4`;
+- later full-snapshot processing MUST converge without silently losing source posts.
 
-Durable Objects remain out of scope for V1 because this project accepts the resulting rare duplicate window.
+Durable Objects remain out of scope because V1 accepts this rare duplicate window.
 
 ## 7. Signal model
 
 ### Source-post signal
-
-Stable identifier:
 
 ```text
 post:<post.id>
@@ -380,41 +311,28 @@ post:<post.id>
 
 ### Receipt-review signal
 
-A receipt-review candidate exists when:
+Candidate condition:
 
 ```text
 event.status == "confirmed"
 && event.confirmationBasis == "receipt_review"
 ```
 
-V1 does **not** use `event.id` alone as the durable receipt-review dedupe identity because the public API contract does not guarantee that an event ID remains the same logical identity across every future regrouping/correction.
+Exact anchor algorithm:
 
-#### Exact anchor algorithm
+1. collect event posts with valid `post.id` and `publishedAt`;
+2. sort by `(publishedAt, post.id)` ascending;
+3. first post becomes `anchorPostId`;
+4. signal ID is `receipt_review:<event.type>:<anchorPostId>`;
+5. persist all current source-post IDs as `receiptAnchorPostIds`.
 
-1. Collect the event's source posts with valid `post.id` and valid `publishedAt`.
-2. Sort them by `(publishedAt, post.id)` ascending.
-3. The first post becomes `anchorPostId`.
-4. The canonical signal ID is:
+Before creating a new receipt signal, inspect existing receipt signals of the same `event.type`; source-post-ID overlap means the same logical receipt confirmation and MUST NOT emit a duplicate even if regrouping changes the canonical first post.
 
-```text
-receipt_review:<event.type>:<anchorPostId>
-```
+If no valid source post exists, V1 does not guess an identity. Record `unanchored_receipt_review` and do not notify until a usable anchor appears or the upstream contract improves.
 
-5. Persist all source-post IDs observed in that event as `receiptAnchorPostIds` inside the immutable signal.
+Previously sent receipt notifications are not retracted. A later regrouped confirmation with overlapping anchor posts is not resent. If all overlap disappears, V1 cannot prove continuity; apply the normal anchor algorithm and emit sanitized correction/regrouping diagnostics when detectable.
 
-Before creating a new receipt-review signal, the detector must also inspect existing receipt-review signals for the same `event.type`. If an existing signal's `receiptAnchorPostIds` intersects the current event's source-post IDs, treat the current candidate as the same logical receipt-review confirmation and do not emit a duplicate even if regrouping changed the canonical first post.
-
-If a receipt-review event has **no valid source post to anchor to**, V1 does not automatically notify it. Record a sanitized `unanchored_receipt_review` diagnostic and wait for a later snapshot that provides an anchor or a future upstream contract that supplies a stronger durable identity. This conservative rule avoids inventing a dedupe identity from mutable event metadata.
-
-If a previously anchored receipt-review event is later corrected, withdrawn, or regrouped:
-
-- existing sent receipt-review signals are not retroactively retracted from notification targets;
-- a later confirmed snapshot is not re-notified when source-post overlap links it to an existing receipt signal;
-- if no source-post overlap survives, V1 cannot prove logical continuity and treats the candidate according to the normal anchor algorithm, while recording sanitized correction/regrouping diagnostics when detectable.
-
-#### Receipt-review notification payload
-
-Receipt-review notifications use a dedicated normalized payload rather than pretending a new source post exists:
+Receipt payload is a distinct shape:
 
 ```json
 {
@@ -432,13 +350,9 @@ Receipt-review notifications use a dedicated normalized payload rather than pret
 }
 ```
 
-`publishedAt` is not invented for receipt-review signals. Their `sortAt` uses the ordering rule in section 10.
+Do not invent `publishedAt` for receipt signals.
 
-### Canonical notification payload
-
-Business logic creates plain structured data. It does not embed platform-specific Markdown or HTML.
-
-Conceptual source-post shape:
+### Source-post canonical notification
 
 ```json
 {
@@ -458,25 +372,21 @@ Conceptual source-post shape:
 }
 ```
 
-This payload is persisted inside the signal before automatic dispatch. The manual `/latest` route builds the same source-post canonical structure from its freshly fetched AIHOT snapshot but does not create or mutate automatic signal/delivery state.
+Canonical data is plain structured text, not platform Markdown/HTML. Automatic signals persist the complete payload before dispatch. `/latest` builds the same source-post payload from its fresh snapshot but does not mutate automatic state.
 
 ## 8. Snapshot validation and watermark algorithm
 
-### Validate before classification
+For every AIHOT `200`:
 
-For every AIHOT `200` response:
+1. validate `schemaVersion`;
+2. validate required collection shapes;
+3. validate timestamps used by ordering/watermark logic;
+4. detect duplicate `post.id` with conflicting data;
+5. reject the snapshot if required invariants fail.
 
-1. Validate `schemaVersion`.
-2. Validate required collection shapes.
-3. Validate timestamps used by ordering/watermark logic.
-4. Detect duplicate `post.id` values with conflicting source data.
-5. Reject the snapshot if required invariants fail.
-
-An incompatible schema, invalid ordering timestamp, or conflicting duplicate must not advance ETag or watermark.
+Validation failure MUST NOT advance ETag/watermark.
 
 ### Boundary watermark
-
-The committed watermark is not a timestamp alone. It is:
 
 ```json
 {
@@ -485,43 +395,20 @@ The committed watermark is not a timestamp alone. It is:
 }
 ```
 
-This solves both same-timestamp posts and signal-retention pruning.
+For unseen source post relative to immutable entry watermark `W0=(T0, IDs0)`:
 
-For an unseen source post relative to committed watermark `W0 = (T0, IDs0)`:
+- `publishedAt < T0` → historical, no notification;
+- `publishedAt > T0` → new candidate;
+- `publishedAt == T0` and ID not in `IDs0` → new candidate;
+- same timestamp and ID already in `IDs0` → known boundary post.
 
-- `publishedAt < T0` → historical backfill/regrouping; do not notify.
-- `publishedAt > T0` → new source-post candidate.
-- `publishedAt == T0` and `post.id ∉ IDs0` → new source-post candidate.
-- `publishedAt == T0` and `post.id ∈ IDs0` → already known boundary post.
+Every post in one snapshot is classified against the **same W0**. Never advance watermark inside the traversal.
 
-### Immutable W0 per snapshot
-
-All candidates in a single AIHOT snapshot must be classified against the same immutable entry watermark `W0`.
-
-Example:
-
-```text
-W0 = 10:00
-snapshot posts = 10:10, 10:05
-```
-
-Both 10:10 and 10:05 are compared to 10:00. The implementation must not advance the watermark while iterating.
-
-Only after classification and durable signal persistence is complete may the Worker compute and commit `W1`.
-
-### W1 construction
-
-`W1.publishedAt` is the maximum valid source-post `publishedAt` in the accepted snapshot.
-
-`W1.postIdsAtPublishedAt` contains all known source-post IDs at exactly that maximum timestamp.
-
-Signal retention must never be used as the only memory of the watermark boundary.
+After classification and durable signal persistence, construct `W1` from the maximum valid `publishedAt` in the accepted snapshot; `postIdsAtPublishedAt` contains every known post ID at exactly that timestamp.
 
 ## 9. Source commit protocol
 
-The source commit boundary is normative.
-
-For AIHOT `200` in the automatic monitoring path:
+For automatic AIHOT `200`:
 
 ```text
 fetch snapshot
@@ -540,61 +427,35 @@ commit meta:v4 with new ETag + W1
   ↓
 dispatch new signals and eligible backlog
   ↓
-persist delivery outcomes
+persist per-target outcomes
 ```
 
-Rules:
+Normative rules:
 
-- If validation fails, do not update `meta:v4`.
-- If any required new signal write fails before the source commit, do not update `meta:v4`.
-- Partially written signal keys are safe: a later retry deduplicates by stable `signalId` and receipt-review overlap rules.
-- Never save a new ETag after an incompatible schema or failed pre-commit persistence step.
-- Only the final `meta:v4` write commits the accepted automatic snapshot boundary.
-- A later `304` is safe because retryable notification payloads are already stored inside `signal:*` keys.
-- Manual `/latest` is intentionally read-and-send only with respect to automatic source state: it does not advance ETag, watermark, signal keys, or automatic delivery keys.
+- validation failure → no `meta:v4` update;
+- any required signal-write failure before commit → no `meta:v4` update;
+- partially written signals are safe because later processing dedupes by stable signal IDs/receipt-overlap rules;
+- incompatible schema or pre-commit failure MUST NOT save new ETag;
+- only final `meta:v4` write commits the accepted source boundary;
+- later `304` is safe because retry payloads already live in `signal:*`;
+- `/latest` does not advance ETag, watermark, signals, or automatic delivery records.
 
-The commit protocol is intentionally crash-recoverable rather than transactional. If two source executions overlap, either may observe stale `meta:v4`; stable signal IDs and immutable signal writes must make later full-snapshot processing converge without silently losing source posts. V1 accepts that overlapping execution can create duplicate work or temporary metadata regression and tests recovery from that condition; it does not emulate a transaction using KV.
+The protocol is crash-recoverable rather than transactional. Overlapping source executions may observe stale `meta:v4` or temporarily regress metadata; stable immutable signals and later full snapshots MUST converge without permanent source-post loss.
 
 ## 10. Signal ordering
 
-New signals from one snapshot are sent in deterministic chronological order:
+New signals in one snapshot are scheduled by `(sortAt, signalId)` ascending.
 
-```text
-(sortAt, signalId) ascending
-```
+- source post: `sortAt = post.publishedAt`
+- receipt review: `sortAt = event.confirmedAt || event.updatedAt || snapshot.checkedAt`
 
-For source-post signals:
+Per-target ordering is best-effort across separate invocations; V1 guarantees deterministic scheduling inside one invocation, not globally transactional external-platform ordering.
 
-```text
-sortAt = post.publishedAt
-```
+## 11. Target model and configuration
 
-For receipt-review signals:
+Supported V1 channels: WeCom, Feishu, DingTalk, Telegram, Bark, ntfy, Slack, Generic Webhook. Email is excluded.
 
-```text
-sortAt = event.confirmedAt || event.updatedAt || snapshot.checkedAt
-```
-
-This prevents a newer confirmation from being scheduled before an older announcement merely because AIHOT's snapshot is newest-first.
-
-Per-target delivery order is best-effort across separate Cron invocations; V1 guarantees deterministic scheduling order inside one invocation but does not claim globally transactional ordering across independent external platforms.
-
-## 11. Target model and secret handling
-
-Supported V1 channels:
-
-- WeCom
-- Feishu
-- DingTalk
-- Telegram
-- Bark
-- ntfy
-- Slack
-- Generic Webhook
-
-Email is intentionally excluded from V1.
-
-### Configuration names
+Configuration names:
 
 ```text
 WEWORK_WEBHOOK_URL
@@ -610,36 +471,22 @@ NTFY_TOKEN
 SLACK_WEBHOOK_URL
 GENERIC_WEBHOOK_URL
 GENERIC_WEBHOOK_TEMPLATE
-
 LATEST_ACCESS_KEY
 ```
 
-`LATEST_ACCESS_KEY` is mandatory for the `/latest` route and must be stored as a Cloudflare Secret, not a plaintext committed variable. It must be a cryptographically random high-entropy value; V1 recommends at least 256 random bits encoded using a URL-safe representation such as Base64URL.
+`LATEST_ACCESS_KEY` is mandatory for `/latest`, stored as a Cloudflare Secret, and SHOULD contain at least 256 random bits encoded URL-safely.
 
-### Multi-target configuration contract
+### Multi-target contract
 
-V1 uses semicolon-separated environment values for multi-target configuration.
+Semicolon-list rules:
 
-Parsing rules for every semicolon-list value:
+1. literal `;` separates entries;
+2. semicolon inside a URL/value must be percent-encoded as `%3B`;
+3. trim surrounding whitespace;
+4. empty elements are invalid;
+5. config errors are sanitized and never echo secret values.
 
-1. Literal `;` separates targets.
-2. A literal semicolon that belongs inside a URL or field value must be percent-encoded as `%3B` before configuration.
-3. Trim surrounding whitespace from every list element.
-4. Empty elements are invalid configuration; never silently skip them.
-5. Configuration errors are exposed only through sanitized diagnostics/status and never echo secret values.
-
-Webhook-style channels use one target per URL element:
-
-```text
-WEWORK_WEBHOOK_URL=url1;url2
-FEISHU_WEBHOOK_URL=url1;url2
-DINGTALK_WEBHOOK_URL=url1;url2
-BARK_URL=url1;url2
-SLACK_WEBHOOK_URL=url1;url2
-GENERIC_WEBHOOK_URL=url1;url2
-```
-
-`WEWORK_MSG_TYPE` is a single global rendering mode for all configured WeCom targets in V1.
+Webhook channels use one target per URL entry. `WEWORK_MSG_TYPE` is a single global WeCom rendering mode in V1.
 
 Telegram uses positional pairing:
 
@@ -648,275 +495,160 @@ TELEGRAM_BOT_TOKEN=token1;token2
 TELEGRAM_CHAT_ID=chat1;chat2
 ```
 
-The two lists must have exactly the same non-zero length. Any mismatch is a configuration error; the implementation must not guess, reuse the last value, or silently drop entries.
+Lengths MUST match exactly and be non-zero.
 
-ntfy uses `NTFY_TOPIC` as the target-count authority:
+ntfy uses `NTFY_TOPIC` as target-count authority. For N topics:
 
-```text
-NTFY_TOPIC=topic1;topic2
-NTFY_SERVER_URL=https://ntfy.sh
-NTFY_TOKEN=token
-```
+- server omitted → `https://ntfy.sh` for all;
+- one server → broadcast to all N;
+- N servers → pair by index;
+- any other count → config error;
+- token omitted → unauthenticated;
+- one token → broadcast to all N;
+- N tokens → pair by index;
+- any other count → config error.
 
-For `N = number of topics`:
-
-- `NTFY_TOPIC` must contain at least one non-empty topic to enable ntfy.
-- `NTFY_SERVER_URL` omitted → use `https://ntfy.sh` for every topic.
-- `NTFY_SERVER_URL` contains one value → broadcast that server to all N topics.
-- `NTFY_SERVER_URL` contains N values → pair by index.
-- Any other server-list length is a configuration error.
-- `NTFY_TOKEN` omitted → unauthenticated target(s).
-- `NTFY_TOKEN` contains one value → broadcast that token to all N topics.
-- `NTFY_TOKEN` contains N values → pair by index.
-- Any other token-list length is a configuration error.
-
-The same expansion rules are deterministic: once expanded, every configured target has exactly one canonical target configuration before hashing.
+Expanded target config is deterministic before hashing.
 
 ### Target identity
 
-Canonicalize the target's relevant secret configuration, compute SHA-256, and use the first 128 bits (32 lowercase hex characters) as the target hash.
-
-Examples:
-
-```text
-wework:0123456789abcdef0123456789abcdef
-telegram:fedcba9876543210fedcba9876543210
-```
-
-The project does not introduce an extra HMAC deployment secret in V1. Notification credentials are expected to be high-entropy secrets already, and the target hash is never exposed through public HTTP responses.
+Canonicalize relevant target config, SHA-256 it, and use the first 128 bits (32 lowercase hex chars) as target hash. Raw secrets MUST NOT appear in KV keys, logs, status, or responses.
 
 ### Target lifecycle
 
-When a target is first configured, create/activate its `target:<targetId>` record.
-
-When a previously configured target disappears:
-
-- mark its target record disabled;
-- mark matching old pending/retry-wait deliveries `disabled` when encountered;
-- exclude them from retry and health pending counts.
-
-If the same target is later re-enabled, it only appears in `targetIds` of signals discovered after reactivation. Historical signals are not replayed merely because a target returns.
-
-Changing the target secret changes its hash and therefore creates a new target identity.
+- first configured → `target:<targetId>` active;
+- removed/rotated target → target disabled, old pending/retry deliveries become `disabled` when encountered, excluded from retry/health pending counts;
+- re-enabled identical target receives only future signals after reactivation;
+- credential change changes target hash and creates a new identity;
+- new targets never receive historical signals merely because they were added.
 
 ## 12. Delivery semantics and retry policy
 
-### Delivery guarantee
+V1 is **at-least-once**, not exactly-once.
 
-V1 provides **at-least-once** delivery semantics, not exactly-once delivery.
-
-Expected guarantee:
-
-> A durable signal is eventually delivered at least once to each eligible active target, subject to retry limits and permanent failures. After a successful delivery has been durably recorded as `sent` and that record is visible to the executing location, the relay does not intentionally resend that signal to the same target.
+> A durable signal is eventually delivered at least once to each eligible target, subject to retry limits and terminal failures. After `sent` is durably recorded and visible to the executing location, the relay does not intentionally resend that signal-target pair.
 
 Known duplicate windows:
 
-1. **Crash-before-ack persistence:** an external platform accepts a message successfully but the Worker crashes before persisting `delivery:... = sent`.
-2. **Overlapping execution with stale KV read:** another Worker execution in a different location temporarily does not observe the newly written `sent` record because Workers KV is eventually consistent.
-
-In either case, the same target can receive a duplicate. Most webhook platforms do not provide a usable end-to-end idempotency key, so V1 documents and accepts this limitation instead of claiming exactly-once delivery.
+1. external platform accepts the message but Worker crashes before persisting `sent`;
+2. overlapping execution at another location temporarily reads stale KV and does not see a new `sent` record.
 
 ### Retryable failures
 
-Treat the following as retryable unless a platform-specific response says otherwise:
+Network error, timeout, HTTP `408`, `429`, `5xx`, and documented platform rate-limit errors are retryable unless platform semantics say otherwise.
 
-- network error;
-- timeout;
-- HTTP `408`;
-- HTTP `429`;
-- HTTP `5xx`;
-- documented platform rate-limit errors.
-
-Use platform `Retry-After` when available. Otherwise use exponential backoff based on a 30-minute base interval, capped at 24 hours.
-
-Conceptual schedule:
+Use platform `Retry-After` when available; otherwise delivery backoff is:
 
 ```text
 30m → 1h → 2h → 4h → 8h → 16h → 24h → 24h
 ```
 
-After 8 failed attempts, mark the delivery `permanent_failure` and expose it through sanitized diagnostics. Do not retry it forever.
+After 8 failed retryable attempts, mark `permanent_failure`.
 
-### Non-retryable failures
+Typical invalid configuration/credential responses (`400`, `401`, `403`, `404`, `410`) are terminal subject to platform-specific semantics.
 
-Treat clearly invalid target/configuration failures as permanent, including typical `400`, `401`, `403`, `404`, or `410` responses, subject to platform-specific semantics.
+All outbound AIHOT/channel requests have a finite timeout; V1 default is 10 seconds.
 
-### Timeout
+### Per-run budget and concurrency
 
-External channel requests and AIHOT requests must use a finite timeout. V1 default target: 10 seconds per outbound request.
-
-### Per-run delivery budget
-
-Source monitoring has priority over backlog processing.
-
-A Cron invocation must cap external notification attempts. V1 default target: at most 10 delivery attempts per run, including new-signal deliveries and retry backlog.
-
-If more eligible work exists, leave it durable for the next Cron.
-
-### Bounded delivery concurrency and ordering
-
-V1 uses a maximum of **3 concurrent target streams** per Worker invocation.
-
-A target stream is identified by `targetId`. Within one target stream, signals are processed strictly serially in `(sortAt, signalId)` ascending order. Different target streams may execute concurrently up to the global limit of 3.
-
-This means:
-
-- the implementation must not `Promise.allSettled()` an unbounded set of deliveries;
-- one slow/bad webhook cannot monopolize every outbound slot;
-- two messages for the same target are not intentionally reordered by local concurrency;
-- independent targets can still make progress in parallel;
-- the per-run delivery budget of 10 remains a separate cap on total attempts.
-
-The manual `/latest` route contains one notification only, so it may send to at most 3 target streams concurrently and continues until all currently configured targets have one result; it does not create persistent delivery work.
+- source monitoring has priority over delivery backlog;
+- maximum 10 notification attempts per Cron invocation;
+- maximum **3 concurrent target streams**;
+- one target stream is one `targetId`;
+- signals inside a target stream run strictly serially in `(sortAt, signalId)` order;
+- different target streams may run concurrently up to 3;
+- no unbounded `Promise.allSettled()` over all deliveries;
+- `/latest` contains one notification and may send to at most 3 targets concurrently until every configured target has one result.
 
 ## 13. Cron execution flow
 
-Default schedule:
+Schedule:
 
 ```text
 */30 * * * *
 ```
 
-Execution order:
+Flow:
 
-1. Load committed `meta:v4` and target configuration.
-2. Reconcile target lifecycle metadata.
-3. Check `source:backoff` before attempting AIHOT.
-4. If upstream backoff has expired or is absent, perform the AIHOT conditional request.
-5. Handle AIHOT:
-   - `304` → reset source-failure count; no new source commit required.
-   - `200` → validate, classify against immutable W0, persist signals, commit `meta:v4`, and reset source-failure count.
-   - `429` → persist source backoff using `Retry-After` when present; do not immediately retry.
-   - `503` / other `5xx` → use `Retry-After` when present, otherwise persist exponential source backoff; preserve committed source state.
-   - network failure / timeout → persist exponential source backoff; preserve committed source state.
-   - incompatible/invalid snapshot → preserve committed source state; do not advance ETag/watermark.
-6. Build the eligible delivery queue from newly created signals plus durable retry backlog.
-7. Group eligible work into per-target streams, preserving `(sortAt, signalId)` order inside each stream.
-8. Dispatch up to 3 target streams concurrently while respecting the per-run delivery budget and each delivery's `nextAttemptAt`.
-9. Persist per-target results.
-10. Persist `diag:last` once at the end of the invocation.
+1. load `meta:v4` and target config;
+2. reconcile target lifecycle;
+3. check `source:backoff`;
+4. if eligible, perform AIHOT conditional request;
+5. handle upstream:
+   - `304` → reset source failure count; no source commit;
+   - `200` → validate, classify against W0, persist signals, commit `meta:v4`, reset source failures;
+   - `429` → persist backoff using `Retry-After` if present;
+   - `503`/other `5xx` → use `Retry-After`, otherwise exponential source backoff;
+   - network/timeout → exponential source backoff;
+   - incompatible/invalid snapshot → preserve source state, no ETag/watermark advance;
+6. build eligible work from new signals + durable retry backlog;
+7. group by target, preserving `(sortAt, signalId)`;
+8. dispatch at most 3 target streams concurrently, max 10 attempts total, respecting `nextAttemptAt`;
+9. persist per-target results;
+10. write `diag:last` once.
 
-The Worker must not allow a large retry backlog to prevent the source check from running.
+Backlog MUST NOT prevent the source check from running.
 
 ## 14. Notification adapters and untrusted-content boundary
 
-AIHOT-returned text, titles, translations, original text, and URLs are treated as untrusted external data.
+AIHOT-returned title/text/translation/original text/URLs are untrusted external data.
 
-Canonical notification data remains plain structured text. Each adapter is responsible for safe channel rendering.
+Every adapter MUST:
 
-Required safeguards:
+- escape platform markup as needed;
+- neutralize upstream mass mentions such as `@channel`, `@here`, `@everyone`, `@all` and platform equivalents;
+- allow only `http:`/`https:` source links;
+- truncate overlong descriptive content while retaining critical metadata/links;
+- validate both HTTP status and platform business-success fields;
+- never interpolate raw upstream content into executable JSON text.
 
-- escape Telegram HTML when HTML mode is used;
-- escape or neutralize channel-specific Markdown/mrkdwn control sequences as needed;
-- suppress mass-mention forms such as `@channel`, `@here`, `@everyone`, or platform equivalents when originating from upstream content;
-- accept only `http:` and `https:` source links;
-- truncate overlong descriptive content while preserving critical metadata and links;
-- never interpolate unescaped upstream content directly into executable JSON text.
-
-### Generic Webhook
-
-`GENERIC_WEBHOOK_TEMPLATE` must be parsed as structured JSON first. Placeholder substitution happens only inside string values, followed by `JSON.stringify()` for transmission.
-
-Do not build a JSON body by raw string concatenation with untrusted `{title}` / `{content}` values.
-
-### Platform-level success
-
-Adapters must validate both HTTP status and platform business-success fields where applicable. HTTP 200 with a platform error code is a failed delivery.
+Generic Webhook template MUST be parsed as structured JSON; placeholder substitution occurs only in string values before final `JSON.stringify()`.
 
 ## 15. HTTP routes
 
 ### `GET /`
 
-Public read-only status endpoint.
-
-Return safe operational information such as:
-
-- service name/version;
-- AIHOT attribution/source URL;
-- schedule;
-- last committed source check;
-- AIHOT `checkedAt`;
-- latest known source-post publication time;
-- last Cron status;
-- count of configured targets per channel;
-- pending/retry/permanent-failure counts.
-
-Never return credentials, raw target hashes, webhook URLs, bot tokens, chat IDs, or Generic Webhook secrets.
+Public sanitized status: service/version, AIHOT attribution/source, schedule, last committed source check, AIHOT `checkedAt`, latest source-post time, last Cron status, target counts, pending/retry/permanent-failure counts. Never return credentials, raw target hashes, or secret-bearing config.
 
 ### `GET /health`
 
-Minimal read-only health endpoint with sanitized status only.
+Minimal sanitized read-only health response.
 
 ### `GET /latest`
 
-V1 keeps `/latest` as a mobile-friendly full-path test and operator endpoint. It intentionally performs a fresh AIHOT fetch so a legal user can verify the complete path:
+Mobile-friendly full-path operator test:
 
 ```text
-AIHOT → Worker validation → latest-post selection → notification adapters → configured targets
+AIHOT → Worker validation → global latest post → adapters → configured targets
 ```
 
-The route remains `GET` so the complete authenticated URL can be saved as a browser bookmark or added to a phone home screen.
-
-#### No-side-effect request guards
-
-Before authentication or any external request:
-
-- `HEAD /latest` must never trigger AIHOT or notification traffic; return `405 Method Not Allowed` with `Allow: GET`.
-- A request whose `Sec-Purpose` or legacy `Purpose` header indicates `prefetch` or `prerender` must not trigger side effects; return `204 No Content` (or an equivalent sanitized no-side-effect response).
-- These guards exist to prevent browser speculative loading, link scanners, or preview systems from firing a side-effecting bookmarked GET.
-
-Only a real `GET` continues to authentication.
-
-#### Authentication
-
-The caller must provide:
+Invocation:
 
 ```text
 GET /latest?key=<LATEST_ACCESS_KEY>
 ```
 
-Security rules:
+No-side-effect guards, before authentication/external work:
 
-1. `LATEST_ACCESS_KEY` is required; there is no unauthenticated fallback.
-2. For a real GET, the key must be validated before reading notification targets, checking source data, or making any external request.
-3. Missing or incorrect keys return `403` immediately.
-4. Authentication failure must never trigger an AIHOT request or notification request.
-5. The implementation must never log the provided key, raw query string, or complete request URL.
-6. Public status/health responses never reveal whether a candidate key is close to or derived from the real key.
-7. The key can be rotated at any time by replacing the Cloudflare Secret; old bookmarked URLs then become invalid.
+- `HEAD /latest` → `405 Method Not Allowed`, `Allow: GET`, no external request;
+- `Sec-Purpose`/legacy `Purpose` indicating `prefetch` or `prerender` → sanitized `204` (or equivalent), no side effects.
 
-A static high-entropy capability URL is an explicit usability/security trade-off chosen for mobile convenience. V1 does not use MD5, TOTP, or per-request HMAC signatures because those would add manual steps without improving the practical security of a bookmarked static operator link.
+For real GET:
 
-#### Pre-fetch abuse controls
+1. validate key before target reads or any external request;
+2. missing/wrong key → immediate `403`;
+3. never log access key, raw query string, or full request URL;
+4. check `manual:latest` 10-second cooldown;
+5. check all active `source:backoff`;
+6. only then fetch AIHOT;
+7. validate full snapshot;
+8. traverse every event/post and select max `posts[].publishedAt`;
+9. build normal source-post canonical notification;
+10. send once to every currently configured target with max concurrency 3;
+11. return sanitized per-target results;
+12. do not mutate automatic signals/deliveries/ETag/watermark.
 
-After authentication and **before fetching AIHOT**:
-
-1. Check `manual:latest`.
-2. If the last accepted manual call was less than 10 seconds ago, return a sanitized cooldown response and do not call AIHOT or any notification target.
-3. Check `source:backoff`.
-4. If source backoff is active — whether created from `429`, `Retry-After`, `5xx`, network failure, or timeout — return a sanitized backoff response and do not call AIHOT.
-5. Only after these checks may `/latest` fetch AIHOT.
-
-The 10-second cooldown is best-effort duplicate protection, not the primary security boundary. The high-entropy access key is the primary authorization boundary.
-
-#### Fresh AIHOT path
-
-For an accepted call:
-
-1. Fetch the current AIHOT Codex Reset snapshot without relying on automatic delivery state.
-2. Validate the snapshot using the same schema and safety rules as the automatic path.
-3. Traverse every event and source post.
-4. Select the globally newest source post by `posts[].publishedAt`; never use `events[0]` as a latest-post shortcut.
-5. Build the same source-post canonical notification model used by automatic signals.
-6. Send it once to every currently configured target using the same bounded target-stream concurrency limit.
-7. Return sanitized per-channel/target results.
-8. Do not create automatic signals, modify automatic delivery keys, or advance the automatic ETag/watermark.
-
-A manual `/latest` call therefore does not suppress a later automatic notification for the same real source post.
-
-#### Response/privacy headers
-
-All `/latest` responses must include at least:
+Responses include:
 
 ```text
 Cache-Control: no-store
@@ -924,284 +656,210 @@ Referrer-Policy: no-referrer
 X-Robots-Tag: noindex, nofollow
 ```
 
-The project documentation must warn that the authenticated bookmark contains a secret in its URL and should not be shared, pasted into public issue reports, or used on untrusted devices. Browser history or sync systems may retain the full URL; users who suspect disclosure should rotate `LATEST_ACCESS_KEY` immediately.
+The bookmarked URL itself is a secret capability and MUST NOT be shared. Suspected disclosure requires rotating `LATEST_ACCESS_KEY`.
 
-### Unknown routes
-
-Return `404`.
+Unknown routes return `404`.
 
 ## 16. Migration to V4
 
-Existing deployments may contain earlier monolithic state formats.
+V3 and earlier lack the immutable payload/target snapshot/per-target state needed for lossless V4 retry reconstruction. Migration is therefore a **baseline migration**:
 
-V3 and earlier did not persist the complete immutable notification payload, target snapshot, and per-target delivery state required by V4. Therefore V1 chooses an explicit **baseline migration**, not a lossy guess at in-flight retry reconstruction.
+1. ignore old incompatible ETag;
+2. fetch/validate full AIHOT snapshot;
+3. build boundary watermark from current posts;
+4. treat currently anchored receipt confirmations as known without sending;
+5. create no historical delivery work;
+6. commit V4 only after baseline succeeds;
+7. record `migrated` diagnostics;
+8. if old pending/in-flight work cannot be represented losslessly, intentionally abandon it and record `legacy_pending_abandoned`.
 
-When `stateVersion !== 4` or no valid V4 commit exists:
-
-1. Do not trust an incompatible old ETag.
-2. Fetch and fully validate a complete AIHOT snapshot.
-3. Build the boundary watermark from all current source posts.
-4. Treat currently anchored receipt-review confirmations as baseline-known without sending notifications.
-5. Do not create historical source-post or receipt-review delivery work.
-6. Commit `meta:v4` only after baseline preparation succeeds.
-7. Record migration diagnostics as `migrated`.
-8. If legacy state indicates old pending/in-flight delivery intent that cannot be represented losslessly as a V4 immutable signal plus target snapshot, **intentionally abandon that legacy retry intent** and record a sanitized `legacy_pending_abandoned` diagnostic.
-
-The migration policy prioritizes avoiding historical floods and malformed retry reconstruction over preserving incomplete legacy retry intent. README upgrade notes must state this explicitly and recommend invoking authenticated `/latest` once after upgrade to verify the complete AIHOT → Worker → notification path.
+README upgrade notes MUST explain this and recommend one authenticated `/latest` call after upgrade to verify the complete path.
 
 ## 17. Retention and cleanup
 
 Retain completed signal state for approximately 90 days.
 
-A signal can be pruned only when all of its target deliveries are terminal:
+A signal is prunable only when every target is terminal: `sent`, `permanent_failure`, or `disabled`. `retry_wait` and missing delivery records are never pruned solely by age. Prune associated delivery keys with the signal.
 
-- `sent`
-- `permanent_failure`
-- `disabled`
-
-Retry-wait or never-attempted target work must not be pruned solely because of age.
-
-When pruning a terminal signal, prune its associated delivery keys as well.
-
-The boundary watermark in `meta:v4` is independent of signal retention, so deleting an old signal cannot resurrect a post whose ID is still represented at the watermark boundary.
+Boundary watermark is independent of signal retention; pruning MUST NOT resurrect an already-known boundary post.
 
 ## 18. Error handling and observability
 
-Store concise sanitized diagnostics, including:
+Store only sanitized diagnostics:
 
-- last Cron start/end;
-- last source status;
-- last source HTTP/result category;
-- current source backoff deadline and consecutive failure count when applicable;
+- Cron start/end;
+- source result/status and active backoff deadline/failure count;
 - latest committed source time;
-- number of active targets;
+- active target counts;
 - pending/retry/permanent-failure counts;
-- receipt-review anchoring/correction warnings;
-- migration warnings such as `legacy_pending_abandoned`;
-- multi-target configuration errors without secret values;
+- receipt anchoring/correction warnings;
+- `legacy_pending_abandoned`;
+- sanitized multi-target config errors;
 - last successful notification time;
 - sanitized last errors.
 
-Never persist full secrets in logs, KV values, errors, or HTTP responses.
-
-For `/latest`, logs and diagnostics may record only sanitized facts such as route name, authentication success/failure category, speculative-request rejection, cooldown/backoff category, and aggregate delivery result. They must not include the access key, raw query string, or full request URL.
+`/latest` logs may record only route, auth result category, speculative-request rejection, cooldown/backoff category, and aggregate delivery result; never key/query/full URL.
 
 ## 19. Testing strategy
 
-Use Vitest.
+Use Vitest. Mandatory regression coverage includes:
 
-### AIHOT and watermark regression tests
+### AIHOT / watermark / receipt
 
-Mandatory tests:
+- global latest selected by `publishedAt`, not `events[0]`;
+- two new posts in one snapshot discovered regardless of traversal order;
+- same-timestamp unseen ID discovered;
+- same-timestamp boundary ID not rediscovered after old signal pruning;
+- historical `< watermark` suppressed;
+- conflicting duplicate `post.id` invalidates snapshot;
+- incompatible schema does not advance source state;
+- receipt anchor chooses earliest `(publishedAt, post.id)`;
+- receipt signal ID formula is exact;
+- regrouping with overlapping source posts does not duplicate;
+- unanchored receipt produces diagnostics/no automatic notification;
+- receipt payload uses `observedAt`, `sourceUrl:null`, no invented `publishedAt`.
 
-- global latest source post is selected by `posts[].publishedAt`, not `events[0]`;
-- two new posts `10:10` and `10:05` are both discovered when entry watermark is `10:00` regardless of iteration order;
-- same-timestamp unseen ID is discovered;
-- same-timestamp boundary ID is not rediscovered after its signal is pruned;
-- historical backfill `< watermark` is not notified;
-- conflicting duplicate `post.id` invalidates the snapshot;
-- incompatible `schemaVersion` does not advance ETag/watermark;
-- receipt-review anchor selects the earliest valid source post by `(publishedAt, post.id)`;
-- receipt-review signal ID is exactly `receipt_review:<event.type>:<anchorPostId>`;
-- receipt-review regrouping with overlapping source-post IDs does not create a duplicate signal;
-- unanchored receipt-review produces diagnostics but no automatic notification;
-- receipt-review payload has `observedAt`, `sourceUrl: null`, and does not invent `publishedAt`.
+### KV / commit protocol
 
-### Commit-protocol tests
+- signal payload persists before `meta:v4` advances;
+- signal-write failure leaves old ETag/watermark;
+- partially persisted stable signals dedupe on later full fetch;
+- `304` still permits pending delivery from persisted payload;
+- implementation never uses a monolithic hot state key;
+- missing delivery key represents pending; no pending pre-write occurs;
+- one accepted snapshot writes `meta:v4` at most once;
+- `diag:last` is written once per invocation;
+- external send succeeds but `sent` persistence fails → later execution remains retryable (at-least-once semantics);
+- two overlapping source executions from stale W0/commit reversal later converge without permanent signal loss.
 
-Mandatory tests:
+### Source backoff
 
-- new signal payload is persisted before `meta:v4` advances;
-- signal persistence failure leaves old ETag/watermark committed;
-- partially persisted stable signals are deduplicated on the next full fetch;
-- `304` still allows pending delivery from persisted canonical payload;
-- no code path requires two rapid writes to one monolithic state key;
-- send succeeds externally but persisting `sent` fails: the next execution still treats the target as undelivered/retryable, demonstrating at-least-once rather than exactly-once semantics;
-- two overlapping source executions starting from the same stale `W0` and committing in opposite order do not permanently lose source-post signals; a later full snapshot converges using stable signal IDs and immutable signal records.
+- `429` + `Retry-After` blocks Cron and `/latest`;
+- `503` + `Retry-After` behaves the same;
+- other `5xx`/network/timeout advance deterministic backoff;
+- `200`/`304` reset consecutive failure count.
 
-### Source-backoff tests
+### Target configuration
 
-Mandatory tests:
+- semicolon lists trim whitespace/reject empties;
+- `%3B` remains inside value;
+- Telegram token/chat cardinality matches exactly;
+- ntfy single server/token broadcasts to N topics;
+- ntfy N-value lists pair by index;
+- other ntfy cardinality fails safely;
+- diagnostics never expose raw secrets/hashes.
 
-- `429` with `Retry-After` blocks Cron and `/latest` until the deadline;
-- `503` with `Retry-After` is handled the same way;
-- `5xx` without `Retry-After` advances deterministic exponential source backoff;
-- network failure and timeout advance source backoff;
-- `200` and `304` reset the consecutive source-failure counter.
+### Delivery
 
-### Target-configuration tests
+- partial success retries only failed target;
+- invalid credential becomes terminal where applicable;
+- target `429` respects retry timing;
+- exponential backoff and 8-attempt terminal transition;
+- removed/re-enabled target behavior;
+- max 10 attempts/run;
+- source poll not starved by backlog;
+- `sent` visible → no intentional resend;
+- max 3 target streams concurrently;
+- same target signals serialize by `(sortAt, signalId)`;
+- slow target does not occupy all progress.
 
-Mandatory tests:
+### Adapter safety
 
-- webhook semicolon lists trim whitespace and reject empty elements;
-- `%3B` remains part of a target value rather than becoming a separator;
-- Telegram token/chat list cardinality must match exactly;
-- ntfy one-server/one-token values broadcast across multiple topics;
-- ntfy N servers/tokens pair by index with N topics;
-- ntfy any other cardinality produces a sanitized configuration error;
-- configuration diagnostics never contain raw webhook URLs, bot tokens, or target hashes.
+Mock `fetch()` for all eight adapters; verify payloads, success/failure normalization, business-error-on-HTTP-200 handling, markup escaping, mass-mention neutralization, URL filtering, and Generic Webhook structured substitution.
 
-### Delivery tests
+### Routes
 
-Mandatory tests:
+- `/` and `/health` never leak secrets/hashes;
+- `HEAD`, prefetch, prerender `/latest` have no side effects;
+- missing/wrong key returns `403` before external requests;
+- authenticated `/latest` checks cooldown/backoff before AIHOT;
+- accepted `/latest` performs fresh AIHOT fetch;
+- global newest post selected correctly;
+- max 3 target concurrency;
+- automatic state not mutated;
+- privacy/cache headers present;
+- logs omit key/full URL.
 
-- WeCom success + Telegram retryable failure retries only Telegram later;
-- `401` / invalid credential becomes permanent failure where applicable;
-- `429` respects target retry timing;
-- retry attempts advance exponential backoff;
-- the eighth failed retryable attempt becomes terminal `permanent_failure`;
-- disabled targets do not remain pending;
-- re-enabled targets do not receive historical signals;
-- per-run delivery budget is enforced;
-- source polling is not starved by backlog;
-- once `sent` is durably recorded and visible, the relay does not intentionally resend that signal/target pair;
-- no more than 3 target streams execute concurrently;
-- signals for the same target are attempted serially in `(sortAt, signalId)` order;
-- a slow target does not prevent other target streams from using available concurrency slots.
+### Migration
 
-### Adapter safety tests
-
-Mock `fetch()` and verify:
-
-- WeCom payload/result;
-- Feishu payload/result;
-- DingTalk payload/result;
-- Telegram payload/result;
-- Bark payload/result;
-- ntfy payload/result;
-- Slack payload/result;
-- Generic Webhook payload/result;
-- upstream markup is escaped;
-- mass mentions are neutralized;
-- non-http(s) URLs are rejected/omitted;
-- Generic Webhook substitution cannot break JSON structure;
-- HTTP 200 plus platform business error is treated as failure.
-
-### Route tests
-
-Mandatory tests:
-
-- `/` and `/health` never expose secrets or target hashes;
-- `HEAD /latest` never performs external requests;
-- prefetch/prerender `/latest` never performs external requests;
-- `/latest` without a key returns `403` before any external request;
-- `/latest` with a wrong key returns `403` before any external request;
-- authenticated `/latest` checks the 10-second cooldown before AIHOT;
-- authenticated `/latest` obeys all active `source:backoff` before AIHOT;
-- accepted `/latest` performs a fresh AIHOT fetch;
-- `/latest` selects the real newest source post by `publishedAt`;
-- `/latest` sends the fresh result to currently configured targets;
-- `/latest` uses at most 3 concurrent target streams;
-- `/latest` does not mutate automatic signal/delivery or source-commit state;
-- `/latest` responses include `no-store`, `no-referrer`, and `noindex` protections;
-- logs never contain the raw access key or complete query URL;
-- unknown routes return 404.
-
-### Migration tests
-
-Mandatory tests:
-
-- V3→V4 migration never replays historical notifications;
-- incompatible old ETag is not reused;
-- legacy retry intent that cannot be represented losslessly is abandoned explicitly and emits `legacy_pending_abandoned` diagnostics;
-- post-migration `/latest` can still verify the full path independently of automatic delivery state.
+- V3→V4 never replays history;
+- old ETag not reused;
+- unreconstructable old pending work explicitly abandoned/diagnosed;
+- post-migration `/latest` verifies full path independently.
 
 ## 20. CI
 
-GitHub Actions initially runs only quality checks:
-
-```text
-npm test
-npm run lint
-```
-
-Run on pull requests and pushes to `main`.
-
-Do not require a Cloudflare API token or auto-deploy from GitHub Actions in V1.
+GitHub Actions runs `npm test` and `npm run lint` for pushes to `main` and pull requests. No Cloudflare API token or automatic deploy is required in V1.
 
 ## 21. Documentation requirements
 
-Provide:
+Provide Chinese `README.md` and English `README_EN.md` covering:
 
-- `README.md` — Chinese primary documentation.
-- `README_EN.md` — English documentation.
-- Cloudflare Workers quick start.
-- KV binding instructions using `CODEX_RESET_STATE`.
-- Secret configuration for every supported channel.
-- Exact multi-target list/cardinality rules, including Telegram and ntfy examples.
-- Cron configuration.
-- `LATEST_ACCESS_KEY` generation and Cloudflare Secret configuration.
-- A mobile-friendly `/latest?key=...` bookmark example.
-- Explicit warning that the bookmarked URL itself contains a secret and must not be shared.
-- Access-key rotation guidance.
-- Explanation that HEAD/prefetch/prerender requests do not execute `/latest` side effects.
-- V3→V4 upgrade note explaining that incomplete legacy pending retries are intentionally abandoned rather than guessed.
-- At-least-once delivery semantics, including crash-window and stale-KV overlapping-execution duplicates.
-- Bounded concurrency behavior: at most 3 target streams, same-target signals serialized.
-- Troubleshooting/FAQ.
-- AIHOT attribution and API/data-usage statement.
-- Security guidance: never commit real webhook URLs, bot tokens, `.env`, `.dev.vars`, or `LATEST_ACCESS_KEY`.
+- Cloudflare Workers quick start and KV binding `CODEX_RESET_STATE`;
+- channel secret configuration and exact multi-target/cardinality rules;
+- Cron schedule;
+- `LATEST_ACCESS_KEY` generation, secret storage, bookmark example, rotation, and URL-secret warning;
+- HEAD/prefetch/prerender behavior;
+- V3→V4 migration limitations;
+- at-least-once semantics and duplicate windows;
+- bounded concurrency behavior;
+- troubleshooting/FAQ;
+- AIHOT attribution/API-data-use boundary;
+- security guidance for `.env`, `.dev.vars`, webhook URLs, bot tokens, and access keys.
 
-README must describe the project as an independent community project, not an official AIHOT product.
+README MUST describe this as an independent community project, not an official AIHOT product.
 
 ## 22. Security requirements
 
-- Keep credential-bearing values in Cloudflare Secrets or local ignored environment files.
-- `.gitignore` must exclude `.env*`, `.dev.vars*`, `.wrangler/`, and dependency/build artifacts as appropriate.
-- Never expose secrets through status endpoints.
-- Never use raw secrets as delivery-state identifiers.
-- Target IDs use at least 128 bits of SHA-256 output.
-- Never log complete target credentials.
-- Treat all upstream AIHOT-rendered text as untrusted content.
-- Generic Webhook templates use structured substitution.
-- `/latest` always requires a high-entropy `LATEST_ACCESS_KEY`; there is no unauthenticated mode.
-- `HEAD`, prefetch, and prerender requests to `/latest` must never cause side effects.
-- Real `/latest` GET requests validate authorization, cooldown, and source backoff before any AIHOT or notification fetch.
-- `/latest` never logs the raw query string, complete request URL, or access key.
-- `/latest` responses are non-cacheable and suppress referrer leakage.
-- Source backoff created by `Retry-After`, `5xx`, network failure, or timeout is checked before every AIHOT fetch, including manual `/latest`.
-- Multi-target configuration errors must fail closed for the affected channel and must not echo credential-bearing values.
-- Outbound notification concurrency is bounded to 3 target streams per invocation.
+- credentials live in Cloudflare Secrets or ignored local env files;
+- ignore `.env*`, `.dev.vars*`, `.wrangler/`, dependency/build artifacts;
+- never expose secrets through status routes/logs/KV keys;
+- target IDs use at least 128 bits of SHA-256 output;
+- upstream text is untrusted and safely rendered;
+- invalid multi-target config fails closed for the affected channel;
+- `/latest` always requires high-entropy key, has no unauthenticated mode, and performs guards/auth/cooldown/backoff before external work;
+- outbound notification concurrency is at most 3 target streams;
+- source backoff applies to every AIHOT fetch.
 
 ## 23. Success criteria for V1
 
 V1 is complete when:
 
-1. A durable new AIHOT Codex source-post signal is eventually delivered at least once to each eligible active target unless that target reaches a documented terminal failure; after `sent` is durably recorded and visible, that signal/target pair is not intentionally resent.
-2. The documentation explicitly acknowledges both known duplicate windows: crash-before-ack persistence and overlapping execution with stale KV reads.
-3. Multiple new posts in one snapshot are all classified against the same immutable W0 and none are lost because of iteration order.
-4. Same-timestamp source posts are deduplicated by the boundary ID set even after old signal pruning.
-5. An anchored `receipt_review` confirmation without a new confirmation source post can produce one stable signal, while unanchored receipt reviews are diagnosed and not guessed.
-6. Receipt-review regrouping with overlapping source-post anchors does not create duplicate confirmation notifications.
-7. Historical AIHOT backfills do not create false fresh alerts.
-8. Newly detected signals with complete canonical payloads are durable before ETag/watermark advances.
-9. AIHOT `304` responses do not prevent pending delivery retries.
-10. Partial target failures do not intentionally resend targets already durably marked `sent` and visible to the executing location.
-11. Retryable target failures back off; invalid credentials do not retry forever.
-12. Source `429`, `503`, other `5xx`, network errors, and timeouts establish deterministic backoff that Cron and `/latest` both obey.
-13. Notification backlog cannot starve source monitoring.
-14. Removed/re-added targets do not receive unintended historical replay.
-15. Multi-target configuration has deterministic parsing/cardinality rules for every V1 channel family, and invalid cardinality fails safely.
-16. No Worker invocation uses more than 3 concurrent target streams, while signals for one target preserve local chronological ordering.
-17. External text cannot inject platform markup, mass mentions, unsafe URLs, or malformed Generic Webhook JSON.
-18. No public HTTP route exposes credentials or target secret hashes.
-19. A bookmarked authenticated `GET /latest` provides a one-tap mobile full-path test while unauthenticated, HEAD, prefetch, and prerender requests cannot trigger AIHOT or notification traffic.
-20. `/latest` respects accidental-repeat cooldown and all source backoff before fetching AIHOT.
-21. V3→V4 migration does not replay history and explicitly abandons unreconstructable legacy pending work rather than silently guessing.
-22. Overlapping/stale-KV execution tests demonstrate eventual convergence without permanent loss of source-post signals.
-23. README clearly credits AIHOT and explains the independent code-license/API-use boundary.
+1. Durable source-post signals are eventually delivered at least once to each eligible target unless terminal failure occurs; after visible durable `sent`, no intentional resend occurs.
+2. Crash-before-ack and stale-KV overlap duplicate windows are documented.
+3. Multiple/new same-timestamp posts are handled without traversal-order loss.
+4. Anchored receipt review produces one stable signal; unanchored receipt is diagnosed, not guessed.
+5. Receipt regrouping with overlapping source anchors does not duplicate.
+6. Historical backfills do not create fresh alerts.
+7. Complete immutable signal payloads are durable before ETag/watermark advance.
+8. `304` does not block pending retries.
+9. Partial target failures do not intentionally resend visible `sent` targets.
+10. Retryable target failures back off and invalid credentials do not retry forever.
+11. Source `429`, `503`, other `5xx`, network, and timeout backoff is deterministic and shared by Cron/`/latest`.
+12. Backlog cannot starve source monitoring.
+13. Removed/re-added targets do not receive unintended historical replay.
+14. Multi-target parsing/cardinality is deterministic and invalid config fails safely.
+15. No invocation exceeds 3 target streams; same-target chronological order is preserved locally.
+16. Upstream content cannot inject mass mentions, unsafe markup/URLs, or malformed Generic Webhook JSON.
+17. No public HTTP route exposes credentials or target hashes.
+18. Authenticated bookmarked `GET /latest` provides one-tap full-path testing while unauthenticated/speculative requests cannot cause side effects.
+19. `/latest` respects cooldown and all source backoff before AIHOT.
+20. V3→V4 does not replay history and explicitly abandons unreconstructable old pending work.
+21. Overlapping/stale-KV tests demonstrate eventual convergence without permanent source-post loss.
+22. Physical KV writes obey the key-level invariants in §6; no monolithic hot-state workaround exists.
+23. README clearly credits AIHOT and explains licensing/API-use boundaries.
 
 ## 24. Future extensions
 
-Potential future work, not required for V1:
+Not required for V1:
 
-- Email delivery.
-- Additional adapters such as Gotify or PushDeer.
-- Optional Cloudflare Workers Rate Limiting binding for operator routes.
-- Optional Cloudflare Access recipes for stronger browser-authenticated operator access.
-- Optional time-limited HMAC or TOTP operator links for users who prefer stronger rotating credentials over one-tap bookmarks.
-- Durable Objects only if future features require strict coordination, distributed exactly-once-style guarantees, or transactional counters.
-- Optional GitHub-to-Cloudflare automatic deployment.
+- Email.
+- Gotify/PushDeer or additional adapters.
+- Optional Workers Rate Limiting binding for operator routes.
+- Optional Cloudflare Access recipes.
+- Optional time-limited HMAC/TOTP operator links.
+- Durable Objects only if future requirements demand strict coordination, distributed exactly-once-style guarantees, or transactional counters.
+- Automatic GitHub→Cloudflare deployment.
 - Richer operational dashboard.
 
-These extensions must not weaken AIHOT attribution, API-use compliance, source commit invariants, secret isolation, or the per-target delivery-state model.
+Future changes MUST NOT weaken AIHOT attribution/compliance, source commit invariants, secret isolation, or per-target delivery state.
