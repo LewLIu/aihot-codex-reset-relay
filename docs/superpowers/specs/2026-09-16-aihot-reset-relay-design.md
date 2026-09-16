@@ -41,6 +41,7 @@ WeCom / Feishu / DingTalk / Telegram / Bark / ntfy / Slack / Generic Webhook
 - Provide an authenticated `GET /latest` operator endpoint that performs a fresh AIHOT fetch and sends the real latest source post to configured notification targets.
 - Keep `/latest` convenient for mobile use by allowing the authenticated URL to be bookmarked directly.
 - Support multiple notification channels and multiple targets per channel.
+- Bound outbound delivery concurrency while preserving per-target signal ordering.
 - Provide public status and health endpoints without exposing secrets.
 - Include automated tests and GitHub Actions CI.
 
@@ -58,6 +59,7 @@ WeCom / Feishu / DingTalk / Telegram / Bark / ntfy / Slack / Generic Webhook
 - Email delivery.
 - Automatic Cloudflare deployment from GitHub Actions.
 - A public unauthenticated endpoint that triggers notifications or AIHOT fetches.
+- Distributed exactly-once delivery guarantees across Cloudflare locations.
 
 ## 3. AIHOT attribution, API rules, and licensing boundary
 
@@ -353,6 +355,19 @@ V1 does not maintain a frequently rewritten `pending:index` key. Codex Reset eve
 
 The current invocation must not depend on KV listing immediately reflecting writes from the same invocation; newly created in-memory candidate signals are dispatched directly after commit. KV listing is for later-run recovery/retry.
 
+### Eventual consistency boundary
+
+Workers KV is eventually consistent across locations. V1 therefore does not use KV as a distributed lock or claim that two overlapping Worker executions can observe each other's just-written delivery state immediately.
+
+Consequences:
+
+- stable immutable `signalId` values remain the source of logical deduplication;
+- a stale read by an overlapping execution can still cause the same target to be sent the same signal twice before the `sent` delivery record becomes visible;
+- metadata such as `meta:v4` may be observed stale by another location for a short period;
+- the design prioritizes avoiding silent data loss over pretending that KV can provide distributed exactly-once coordination.
+
+Durable Objects remain out of scope for V1 because this project accepts the resulting rare duplicate window.
+
 ## 7. Signal model
 
 ### Source-post signal
@@ -538,6 +553,8 @@ Rules:
 - A later `304` is safe because retryable notification payloads are already stored inside `signal:*` keys.
 - Manual `/latest` is intentionally read-and-send only with respect to automatic source state: it does not advance ETag, watermark, signal keys, or automatic delivery keys.
 
+The commit protocol is intentionally crash-recoverable rather than transactional. If two source executions overlap, either may observe stale `meta:v4`; stable signal IDs and immutable signal writes must make later full-snapshot processing converge without silently losing source posts. V1 accepts that overlapping execution can create duplicate work or temporary metadata regression and tests recovery from that condition; it does not emulate a transaction using KV.
+
 ## 10. Signal ordering
 
 New signals from one snapshot are sent in deterministic chronological order:
@@ -599,9 +616,61 @@ LATEST_ACCESS_KEY
 
 `LATEST_ACCESS_KEY` is mandatory for the `/latest` route and must be stored as a Cloudflare Secret, not a plaintext committed variable. It must be a cryptographically random high-entropy value; V1 recommends at least 256 random bits encoded using a URL-safe representation such as Base64URL.
 
-Webhook-style values may use `;` to configure multiple targets.
+### Multi-target configuration contract
 
-For Telegram, token and chat ID lists are paired by index. A count mismatch is a configuration error.
+V1 uses semicolon-separated environment values for multi-target configuration.
+
+Parsing rules for every semicolon-list value:
+
+1. Literal `;` separates targets.
+2. A literal semicolon that belongs inside a URL or field value must be percent-encoded as `%3B` before configuration.
+3. Trim surrounding whitespace from every list element.
+4. Empty elements are invalid configuration; never silently skip them.
+5. Configuration errors are exposed only through sanitized diagnostics/status and never echo secret values.
+
+Webhook-style channels use one target per URL element:
+
+```text
+WEWORK_WEBHOOK_URL=url1;url2
+FEISHU_WEBHOOK_URL=url1;url2
+DINGTALK_WEBHOOK_URL=url1;url2
+BARK_URL=url1;url2
+SLACK_WEBHOOK_URL=url1;url2
+GENERIC_WEBHOOK_URL=url1;url2
+```
+
+`WEWORK_MSG_TYPE` is a single global rendering mode for all configured WeCom targets in V1.
+
+Telegram uses positional pairing:
+
+```text
+TELEGRAM_BOT_TOKEN=token1;token2
+TELEGRAM_CHAT_ID=chat1;chat2
+```
+
+The two lists must have exactly the same non-zero length. Any mismatch is a configuration error; the implementation must not guess, reuse the last value, or silently drop entries.
+
+ntfy uses `NTFY_TOPIC` as the target-count authority:
+
+```text
+NTFY_TOPIC=topic1;topic2
+NTFY_SERVER_URL=https://ntfy.sh
+NTFY_TOKEN=token
+```
+
+For `N = number of topics`:
+
+- `NTFY_TOPIC` must contain at least one non-empty topic to enable ntfy.
+- `NTFY_SERVER_URL` omitted → use `https://ntfy.sh` for every topic.
+- `NTFY_SERVER_URL` contains one value → broadcast that server to all N topics.
+- `NTFY_SERVER_URL` contains N values → pair by index.
+- Any other server-list length is a configuration error.
+- `NTFY_TOKEN` omitted → unauthenticated target(s).
+- `NTFY_TOKEN` contains one value → broadcast that token to all N topics.
+- `NTFY_TOKEN` contains N values → pair by index.
+- Any other token-list length is a configuration error.
+
+The same expansion rules are deterministic: once expanded, every configured target has exactly one canonical target configuration before hashing.
 
 ### Target identity
 
@@ -638,9 +707,14 @@ V1 provides **at-least-once** delivery semantics, not exactly-once delivery.
 
 Expected guarantee:
 
-> A durable signal is eventually delivered at least once to each eligible active target, subject to retry limits and permanent failures. After a successful delivery has been durably recorded as `sent`, the relay does not intentionally resend that signal to the same target.
+> A durable signal is eventually delivered at least once to each eligible active target, subject to retry limits and permanent failures. After a successful delivery has been durably recorded as `sent` and that record is visible to the executing location, the relay does not intentionally resend that signal to the same target.
 
-There is an unavoidable crash window: an external platform may accept a message successfully and the Worker may crash before persisting `delivery:... = sent`. On recovery, that target can receive a duplicate because most webhook platforms do not provide a usable idempotency key. The project must document this possibility rather than claiming exactly-once delivery.
+Known duplicate windows:
+
+1. **Crash-before-ack persistence:** an external platform accepts a message successfully but the Worker crashes before persisting `delivery:... = sent`.
+2. **Overlapping execution with stale KV read:** another Worker execution in a different location temporarily does not observe the newly written `sent` record because Workers KV is eventually consistent.
+
+In either case, the same target can receive a duplicate. Most webhook platforms do not provide a usable end-to-end idempotency key, so V1 documents and accepts this limitation instead of claiming exactly-once delivery.
 
 ### Retryable failures
 
@@ -679,7 +753,21 @@ A Cron invocation must cap external notification attempts. V1 default target: at
 
 If more eligible work exists, leave it durable for the next Cron.
 
-The manual `/latest` route is not part of the automatic retry queue and does not create persistent delivery work; it attempts each currently configured target once and returns sanitized per-target results.
+### Bounded delivery concurrency and ordering
+
+V1 uses a maximum of **3 concurrent target streams** per Worker invocation.
+
+A target stream is identified by `targetId`. Within one target stream, signals are processed strictly serially in `(sortAt, signalId)` ascending order. Different target streams may execute concurrently up to the global limit of 3.
+
+This means:
+
+- the implementation must not `Promise.allSettled()` an unbounded set of deliveries;
+- one slow/bad webhook cannot monopolize every outbound slot;
+- two messages for the same target are not intentionally reordered by local concurrency;
+- independent targets can still make progress in parallel;
+- the per-run delivery budget of 10 remains a separate cap on total attempts.
+
+The manual `/latest` route contains one notification only, so it may send to at most 3 target streams concurrently and continues until all currently configured targets have one result; it does not create persistent delivery work.
 
 ## 13. Cron execution flow
 
@@ -703,8 +791,8 @@ Execution order:
    - network failure / timeout → persist exponential source backoff; preserve committed source state.
    - incompatible/invalid snapshot → preserve committed source state; do not advance ETag/watermark.
 6. Build the eligible delivery queue from newly created signals plus durable retry backlog.
-7. Sort by signal chronology and respect `nextAttemptAt`.
-8. Dispatch up to the per-run delivery budget.
+7. Group eligible work into per-target streams, preserving `(sortAt, signalId)` order inside each stream.
+8. Dispatch up to 3 target streams concurrently while respecting the per-run delivery budget and each delivery's `nextAttemptAt`.
 9. Persist per-target results.
 10. Persist `diag:last` once at the end of the invocation.
 
@@ -820,7 +908,7 @@ For an accepted call:
 3. Traverse every event and source post.
 4. Select the globally newest source post by `posts[].publishedAt`; never use `events[0]` as a latest-post shortcut.
 5. Build the same source-post canonical notification model used by automatic signals.
-6. Send it once to every currently configured target.
+6. Send it once to every currently configured target using the same bounded target-stream concurrency limit.
 7. Return sanitized per-channel/target results.
 8. Do not create automatic signals, modify automatic delivery keys, or advance the automatic ETag/watermark.
 
@@ -890,6 +978,7 @@ Store concise sanitized diagnostics, including:
 - pending/retry/permanent-failure counts;
 - receipt-review anchoring/correction warnings;
 - migration warnings such as `legacy_pending_abandoned`;
+- multi-target configuration errors without secret values;
 - last successful notification time;
 - sanitized last errors.
 
@@ -926,7 +1015,9 @@ Mandatory tests:
 - signal persistence failure leaves old ETag/watermark committed;
 - partially persisted stable signals are deduplicated on the next full fetch;
 - `304` still allows pending delivery from persisted canonical payload;
-- no code path requires two rapid writes to one monolithic state key.
+- no code path requires two rapid writes to one monolithic state key;
+- send succeeds externally but persisting `sent` fails: the next execution still treats the target as undelivered/retryable, demonstrating at-least-once rather than exactly-once semantics;
+- two overlapping source executions starting from the same stale `W0` and committing in opposite order do not permanently lose source-post signals; a later full snapshot converges using stable signal IDs and immutable signal records.
 
 ### Source-backoff tests
 
@@ -937,6 +1028,18 @@ Mandatory tests:
 - `5xx` without `Retry-After` advances deterministic exponential source backoff;
 - network failure and timeout advance source backoff;
 - `200` and `304` reset the consecutive source-failure counter.
+
+### Target-configuration tests
+
+Mandatory tests:
+
+- webhook semicolon lists trim whitespace and reject empty elements;
+- `%3B` remains part of a target value rather than becoming a separator;
+- Telegram token/chat list cardinality must match exactly;
+- ntfy one-server/one-token values broadcast across multiple topics;
+- ntfy N servers/tokens pair by index with N topics;
+- ntfy any other cardinality produces a sanitized configuration error;
+- configuration diagnostics never contain raw webhook URLs, bot tokens, or target hashes.
 
 ### Delivery tests
 
@@ -951,7 +1054,10 @@ Mandatory tests:
 - re-enabled targets do not receive historical signals;
 - per-run delivery budget is enforced;
 - source polling is not starved by backlog;
-- once `sent` is durably recorded, the relay does not intentionally resend that signal/target pair.
+- once `sent` is durably recorded and visible, the relay does not intentionally resend that signal/target pair;
+- no more than 3 target streams execute concurrently;
+- signals for the same target are attempted serially in `(sortAt, signalId)` order;
+- a slow target does not prevent other target streams from using available concurrency slots.
 
 ### Adapter safety tests
 
@@ -985,6 +1091,7 @@ Mandatory tests:
 - accepted `/latest` performs a fresh AIHOT fetch;
 - `/latest` selects the real newest source post by `publishedAt`;
 - `/latest` sends the fresh result to currently configured targets;
+- `/latest` uses at most 3 concurrent target streams;
 - `/latest` does not mutate automatic signal/delivery or source-commit state;
 - `/latest` responses include `no-store`, `no-referrer`, and `noindex` protections;
 - logs never contain the raw access key or complete query URL;
@@ -1021,6 +1128,7 @@ Provide:
 - Cloudflare Workers quick start.
 - KV binding instructions using `CODEX_RESET_STATE`.
 - Secret configuration for every supported channel.
+- Exact multi-target list/cardinality rules, including Telegram and ntfy examples.
 - Cron configuration.
 - `LATEST_ACCESS_KEY` generation and Cloudflare Secret configuration.
 - A mobile-friendly `/latest?key=...` bookmark example.
@@ -1028,7 +1136,8 @@ Provide:
 - Access-key rotation guidance.
 - Explanation that HEAD/prefetch/prerender requests do not execute `/latest` side effects.
 - V3→V4 upgrade note explaining that incomplete legacy pending retries are intentionally abandoned rather than guessed.
-- At-least-once delivery semantics and the possible crash-window duplicate.
+- At-least-once delivery semantics, including crash-window and stale-KV overlapping-execution duplicates.
+- Bounded concurrency behavior: at most 3 target streams, same-target signals serialized.
 - Troubleshooting/FAQ.
 - AIHOT attribution and API/data-usage statement.
 - Security guidance: never commit real webhook URLs, bot tokens, `.env`, `.dev.vars`, or `LATEST_ACCESS_KEY`.
@@ -1051,13 +1160,15 @@ README must describe the project as an independent community project, not an off
 - `/latest` never logs the raw query string, complete request URL, or access key.
 - `/latest` responses are non-cacheable and suppress referrer leakage.
 - Source backoff created by `Retry-After`, `5xx`, network failure, or timeout is checked before every AIHOT fetch, including manual `/latest`.
+- Multi-target configuration errors must fail closed for the affected channel and must not echo credential-bearing values.
+- Outbound notification concurrency is bounded to 3 target streams per invocation.
 
 ## 23. Success criteria for V1
 
 V1 is complete when:
 
-1. A durable new AIHOT Codex source-post signal is eventually delivered at least once to each eligible active target unless that target reaches a documented terminal failure; after `sent` is durably recorded, that signal/target pair is not intentionally resent.
-2. The documentation explicitly acknowledges the unavoidable crash window in which an external send may succeed before its durable acknowledgement and therefore may be duplicated on recovery.
+1. A durable new AIHOT Codex source-post signal is eventually delivered at least once to each eligible active target unless that target reaches a documented terminal failure; after `sent` is durably recorded and visible, that signal/target pair is not intentionally resent.
+2. The documentation explicitly acknowledges both known duplicate windows: crash-before-ack persistence and overlapping execution with stale KV reads.
 3. Multiple new posts in one snapshot are all classified against the same immutable W0 and none are lost because of iteration order.
 4. Same-timestamp source posts are deduplicated by the boundary ID set even after old signal pruning.
 5. An anchored `receipt_review` confirmation without a new confirmation source post can produce one stable signal, while unanchored receipt reviews are diagnosed and not guessed.
@@ -1065,17 +1176,20 @@ V1 is complete when:
 7. Historical AIHOT backfills do not create false fresh alerts.
 8. Newly detected signals with complete canonical payloads are durable before ETag/watermark advances.
 9. AIHOT `304` responses do not prevent pending delivery retries.
-10. Partial target failures do not intentionally resend targets already durably marked `sent`.
+10. Partial target failures do not intentionally resend targets already durably marked `sent` and visible to the executing location.
 11. Retryable target failures back off; invalid credentials do not retry forever.
 12. Source `429`, `503`, other `5xx`, network errors, and timeouts establish deterministic backoff that Cron and `/latest` both obey.
 13. Notification backlog cannot starve source monitoring.
 14. Removed/re-added targets do not receive unintended historical replay.
-15. External text cannot inject platform markup, mass mentions, unsafe URLs, or malformed Generic Webhook JSON.
-16. No public HTTP route exposes credentials or target secret hashes.
-17. A bookmarked authenticated `GET /latest` provides a one-tap mobile full-path test while unauthenticated, HEAD, prefetch, and prerender requests cannot trigger AIHOT or notification traffic.
-18. `/latest` respects accidental-repeat cooldown and all source backoff before fetching AIHOT.
-19. V3→V4 migration does not replay history and explicitly abandons unreconstructable legacy pending work rather than silently guessing.
-20. README clearly credits AIHOT and explains the independent code-license/API-use boundary.
+15. Multi-target configuration has deterministic parsing/cardinality rules for every V1 channel family, and invalid cardinality fails safely.
+16. No Worker invocation uses more than 3 concurrent target streams, while signals for one target preserve local chronological ordering.
+17. External text cannot inject platform markup, mass mentions, unsafe URLs, or malformed Generic Webhook JSON.
+18. No public HTTP route exposes credentials or target secret hashes.
+19. A bookmarked authenticated `GET /latest` provides a one-tap mobile full-path test while unauthenticated, HEAD, prefetch, and prerender requests cannot trigger AIHOT or notification traffic.
+20. `/latest` respects accidental-repeat cooldown and all source backoff before fetching AIHOT.
+21. V3→V4 migration does not replay history and explicitly abandons unreconstructable legacy pending work rather than silently guessing.
+22. Overlapping/stale-KV execution tests demonstrate eventual convergence without permanent loss of source-post signals.
+23. README clearly credits AIHOT and explains the independent code-license/API-use boundary.
 
 ## 24. Future extensions
 
@@ -1086,7 +1200,7 @@ Potential future work, not required for V1:
 - Optional Cloudflare Workers Rate Limiting binding for operator routes.
 - Optional Cloudflare Access recipes for stronger browser-authenticated operator access.
 - Optional time-limited HMAC or TOTP operator links for users who prefer stronger rotating credentials over one-tap bookmarks.
-- Durable Objects only if future features require strict coordination or transactional counters.
+- Durable Objects only if future features require strict coordination, distributed exactly-once-style guarantees, or transactional counters.
 - Optional GitHub-to-Cloudflare automatic deployment.
 - Richer operational dashboard.
 
