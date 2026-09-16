@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a self-hosted Cloudflare Worker that safely monitors AIHOT Codex Reset snapshots, persists immutable signals/per-target delivery state in Workers KV, retries failures, supports eight notification adapters, and exposes authenticated one-tap `GET /latest` testing.
+**Goal:** Build a self-hosted Cloudflare Worker that monitors AIHOT Codex Reset snapshots, persists immutable signals and per-target delivery state in Workers KV, retries failures safely, supports eight notification channels, and exposes authenticated one-tap `GET /latest` testing.
 
-**Architecture:** ES-module JavaScript on Cloudflare Workers. Pure domain modules validate AIHOT snapshots and derive deterministic signals; Workers KV stores separated `meta`, `signal`, `delivery`, `target`, backoff, manual-cooldown, and diagnostic keys. Notification adapters share one canonical notification model, while a bounded dispatcher enforces three concurrent target streams and per-target serial ordering.
+**Architecture:** ES-module JavaScript on Cloudflare Workers. Pure domain modules validate AIHOT snapshots and derive deterministic signals; Workers KV stores separate `meta`, `signal`, `delivery`, `target`, source-backoff, manual-cooldown, and diagnostics keys. Notification adapters consume one canonical notification model, while a dispatcher enforces three concurrent target streams and serial ordering inside each target.
 
 **Tech Stack:** JavaScript ES modules, Cloudflare Workers + Workers KV, Wrangler 4, Vitest 4.1+ with `@cloudflare/vitest-plugin`, ESLint 9, GitHub Actions.
 
@@ -16,66 +16,68 @@
 - Cron: `*/30 * * * *`.
 - Workers KV binding: `CODEX_RESET_STATE`.
 - Expected AIHOT `schemaVersion`: `1`.
-- Source-post signal ID: `post:<post.id>`.
-- Receipt signal ID: `receipt_review:<event.type>:<anchorPostId>` with overlap dedupe.
-- Boundary watermark: `{ publishedAt, postIdsAtPublishedAt[] }`; one immutable W0 per snapshot.
-- Signal records are immutable; missing `delivery:<signalId>:<targetId>` means pending.
-- Never collapse state into one hot KV key and never add sleeps to work around same-key write limits.
-- Delivery is at-least-once; crash/stale-KV duplicate windows are accepted and documented.
+- Source signal ID: `post:<post.id>`.
+- Receipt signal ID: `receipt_review:<event.type>:<anchorPostId>` plus source-post-overlap dedupe.
+- Boundary watermark: `{ publishedAt, postIdsAtPublishedAt[] }`; every snapshot uses one immutable entry W0.
+- `signal:*` is immutable; missing `delivery:<signalId>:<targetId>` means pending.
+- Never collapse physical state into one hot KV key and never add sleeps to work around same-key limits.
+- Delivery is at-least-once; crash-before-ack and stale-KV overlap duplicate windows are accepted/documented.
 - Delivery retry: 30m → 1h → 2h → 4h → 8h → 16h → 24h → 24h; eighth failed retryable attempt becomes `permanent_failure`.
 - Source backoff without `Retry-After`: 5m → 10m → 20m → 40m → 80m → 160m → 320m → 6h.
-- Maximum 10 automatic notification attempts per Cron invocation.
-- Maximum 3 concurrent target streams; signals for one target are serial by `(sortAt, signalId)`.
-- Outbound request timeout: 10 seconds.
-- `/latest` remains `GET`, always requires `LATEST_ACCESS_KEY`, and must check HEAD/prefetch guards, auth, cooldown, and source backoff before AIHOT.
-- `/latest` never mutates automatic signal/delivery/ETag/watermark state.
-- AIHOT text/URLs are untrusted input; adapters escape markup, neutralize mass mentions, filter URLs, and validate platform business success.
+- Automatic delivery budget: 10 attempts per Cron invocation.
+- Concurrency: at most 3 target streams; one target's signals are serial by `(sortAt, signalId)`.
+- All AIHOT/channel HTTP calls have a 10-second timeout.
+- `/latest` remains GET, requires `LATEST_ACCESS_KEY`, and checks speculative-request guards, auth, cooldown, and source backoff before AIHOT.
+- `/latest` may update only `manual:latest` and shared source-backoff operational state; it never mutates automatic signals/deliveries/ETag/watermark.
+- AIHOT content is untrusted; escape markup, neutralize mass mentions, filter URLs, and validate platform business success.
 - V3→V4 is baseline migration; unreconstructable legacy pending intent is abandoned with `legacy_pending_abandoned` diagnostics.
-- No Durable Objects, email delivery, admin UI, SaaS, or automatic Cloudflare deployment in V1.
+- V1 excludes Durable Objects, email, admin UI, SaaS, and automatic deployment.
 
 ---
 
 ## File Map
 
 ```text
-.github/workflows/ci.yml                 # test/lint CI only
-src/index.js                             # Worker fetch + scheduled entrypoints
-src/config/targets.js                    # env parsing, multi-target expansion, config diagnostics
-src/aihot/client.js                      # conditional fetch, timeout, Retry-After parsing
-src/aihot/validate.js                    # schema/snapshot invariants
-src/aihot/latest.js                      # global newest source-post selection
-src/monitor/signals.js                   # watermark/source-post/receipt signal derivation
-src/monitor/reset-monitor.js             # Cron orchestration + source commit protocol
-src/state/kv-store.js                    # physical KV key contract, listing, migration, retention
-src/notification/message.js              # canonical notification builders
-src/notification/retry.js                # retry classification/backoff
-src/notification/dispatcher.js           # per-target streams, concurrency=3, budget=10
-src/notification/channels/wework.js      # WeCom adapter
-src/notification/channels/feishu.js      # Feishu adapter
-src/notification/channels/dingtalk.js    # DingTalk adapter
-src/notification/channels/telegram.js    # Telegram adapter
-src/notification/channels/bark.js        # Bark adapter
-src/notification/channels/ntfy.js        # ntfy adapter
-src/notification/channels/slack.js       # Slack adapter
-src/notification/channels/generic-webhook.js # generic JSON webhook adapter
-src/routes/status.js                     # GET / and GET /health
-src/routes/latest.js                     # authenticated GET /latest
-src/utils/crypto.js                      # SHA-256 128-bit target fingerprints + constant-time key compare
-src/utils/text.js                        # escaping, mention neutralization, URL filtering, truncation
-src/utils/time.js                        # ISO parsing, Retry-After, backoff helpers
-test/fixtures/aihot-response.json        # regression fixture reproducing events[0] ordering bug
-test/**/*.test.js                        # unit/integration tests
-vitest.config.js                         # @cloudflare/vitest-plugin config
-eslint.config.js                         # ESLint flat config
-wrangler.jsonc                           # Worker, KV auto-provision binding, Cron trigger
-package.json                             # scripts/dependencies
-.gitignore                               # secret/build/local-state exclusions
-README.md / README_EN.md / LICENSE       # user docs + MIT license
+.github/workflows/ci.yml
+src/index.js
+src/config/targets.js
+src/aihot/client.js
+src/aihot/validate.js
+src/aihot/latest.js
+src/monitor/signals.js
+src/monitor/reset-monitor.js
+src/state/kv-store.js
+src/notification/message.js
+src/notification/retry.js
+src/notification/dispatcher.js
+src/notification/channels/wework.js
+src/notification/channels/feishu.js
+src/notification/channels/dingtalk.js
+src/notification/channels/telegram.js
+src/notification/channels/bark.js
+src/notification/channels/ntfy.js
+src/notification/channels/slack.js
+src/notification/channels/generic-webhook.js
+src/routes/status.js
+src/routes/latest.js
+src/utils/crypto.js
+src/utils/text.js
+src/utils/time.js
+test/fixtures/aihot-response.json
+test/**/*.test.js
+vitest.config.js
+eslint.config.js
+wrangler.jsonc
+package.json
+.gitignore
+README.md
+README_EN.md
+LICENSE
 ```
 
 ---
 
-### Task 1: Scaffold the Worker, test runtime, linting, and configuration
+### Task 1: Scaffold Worker tooling and runtime
 
 **Files:**
 - Create: `package.json`
@@ -84,15 +86,13 @@ README.md / README_EN.md / LICENSE       # user docs + MIT license
 - Create: `eslint.config.js`
 - Create: `.gitignore`
 - Create: `src/index.js`
-- Create: `test/smoke.test.js`
+- Test: `test/smoke.test.js`
 
 **Interfaces:**
-- Produces: Cloudflare Worker ES-module entrypoint exporting `fetch(request, env, ctx)` and `scheduled(controller, env, ctx)`.
-- Produces: runtime binding `env.CODEX_RESET_STATE`.
+- Produces Worker default export with `fetch(request, env, ctx)` and `scheduled(controller, env, ctx)`.
+- Produces KV binding `env.CODEX_RESET_STATE`.
 
-- [ ] **Step 1: Initialize package metadata and install current supported tooling**
-
-Run:
+- [ ] **Step 1: Initialize tooling**
 
 ```bash
 npm init -y
@@ -105,11 +105,9 @@ npm pkg set scripts.deploy="wrangler deploy"
 npm i -D wrangler@4 vitest@^4.1.0 @cloudflare/vitest-plugin@latest eslint@^9 @eslint/js@^9 globals@latest
 ```
 
-Expected: `package.json` is ES-module based and `npm test`/`npm run lint` scripts exist.
-
 - [ ] **Step 2: Write the failing smoke test**
 
-Create `test/smoke.test.js`:
+`test/smoke.test.js`:
 
 ```js
 import { describe, expect, it } from "vitest";
@@ -123,17 +121,11 @@ describe("worker scaffold", () => {
 });
 ```
 
-Run:
+Run `npm test -- test/smoke.test.js` and expect failure because `src/index.js` does not exist.
 
-```bash
-npm test -- test/smoke.test.js
-```
+- [ ] **Step 3: Add configuration and minimal Worker**
 
-Expected: FAIL because `src/index.js` does not exist.
-
-- [ ] **Step 3: Add Wrangler/Vitest/ESLint configuration and minimal entrypoint**
-
-Create `wrangler.jsonc`:
+`wrangler.jsonc`:
 
 ```jsonc
 {
@@ -141,19 +133,13 @@ Create `wrangler.jsonc`:
   "name": "aihot-codex-reset-relay",
   "main": "src/index.js",
   "compatibility_date": "2026-09-16",
-  "kv_namespaces": [
-    { "binding": "CODEX_RESET_STATE" }
-  ],
-  "triggers": {
-    "crons": ["*/30 * * * *"]
-  },
-  "observability": {
-    "enabled": true
-  }
+  "kv_namespaces": [{ "binding": "CODEX_RESET_STATE" }],
+  "triggers": { "crons": ["*/30 * * * *"] },
+  "observability": { "enabled": true }
 }
 ```
 
-Create `vitest.config.js`:
+`vitest.config.js`:
 
 ```js
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
@@ -165,7 +151,7 @@ export default defineConfig({
 });
 ```
 
-Create `eslint.config.js`:
+`eslint.config.js`:
 
 ```js
 import js from "@eslint/js";
@@ -179,14 +165,14 @@ export default [
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: "module",
-      globals: { ...globals.worker, ...globals.node },
+      globals: { ...globals.browser, ...globals.node },
     },
-    rules: { "no-unused-vars": ["error", { "argsIgnorePattern": "^_" }] },
+    rules: { "no-unused-vars": ["error", { argsIgnorePattern: "^_" }] },
   },
 ];
 ```
 
-Create `.gitignore`:
+`.gitignore`:
 
 ```gitignore
 node_modules/
@@ -199,22 +185,18 @@ coverage/
 .DS_Store
 ```
 
-Create `src/index.js`:
+`src/index.js`:
 
 ```js
 export default {
   async fetch() {
-    return new Response(JSON.stringify({ service: "aihot-codex-reset-relay" }), {
-      headers: { "content-type": "application/json; charset=utf-8" },
-    });
+    return Response.json({ service: "aihot-codex-reset-relay" });
   },
   async scheduled(_controller, _env, _ctx) {},
 };
 ```
 
-- [ ] **Step 4: Verify scaffold is green**
-
-Run:
+- [ ] **Step 4: Verify scaffold**
 
 ```bash
 npm test -- test/smoke.test.js
@@ -222,7 +204,7 @@ npm run lint
 npx wrangler deploy --dry-run
 ```
 
-Expected: all commands PASS; dry-run recognizes `CODEX_RESET_STATE` and Cron config.
+Expected: all pass.
 
 - [ ] **Step 5: Commit**
 
@@ -233,83 +215,83 @@ git commit -m "chore: scaffold Cloudflare Worker project"
 
 ---
 
-### Task 2: Implement target configuration parsing and target fingerprints
+### Task 2: Target configuration, hashing, and access-key comparison
 
 **Files:**
 - Create: `src/config/targets.js`
 - Create: `src/utils/crypto.js`
 - Test: `test/config/targets.test.js`
+- Test: `test/utils/crypto.test.js`
 
 **Interfaces:**
-- Produces: `parseTargets(env) -> Promise<{ targets: Target[], errors: ConfigError[] }>`.
-- Produces: `target.id` in `<channel>:<32 lowercase hex>` form.
-- Produces: `constantTimeEqual(a, b) -> boolean` for `/latest` key verification.
+- Produces `parseTargets(env) -> Promise<{ targets, errors }>`.
+- Target shape: `{ id, channel, config }`.
+- Produces `sha256Prefix128(value)` and `constantTimeEqual(a, b)`.
 
-- [ ] **Step 1: Write failing multi-target/cardinality tests**
+- [ ] **Step 1: Write failing config tests**
 
-Create `test/config/targets.test.js`:
+`test/config/targets.test.js`:
 
 ```js
 import { describe, expect, it } from "vitest";
 import { parseTargets } from "../../src/config/targets.js";
 
 describe("parseTargets", () => {
-  it("pairs Telegram lists by index", async () => {
-    const result = await parseTargets({
-      TELEGRAM_BOT_TOKEN: "tok-a;tok-b",
-      TELEGRAM_CHAT_ID: "100;200",
-    });
-    expect(result.errors).toEqual([]);
-    expect(result.targets.map((t) => [t.channel, t.config.chatId])).toEqual([
-      ["telegram", "100"],
-      ["telegram", "200"],
-    ]);
+  it("pairs Telegram token/chat lists exactly", async () => {
+    const out = await parseTargets({ TELEGRAM_BOT_TOKEN: "ta;tb", TELEGRAM_CHAT_ID: "1;2" });
+    expect(out.errors).toEqual([]);
+    expect(out.targets.filter((t) => t.channel === "telegram").map((t) => t.config.chatId)).toEqual(["1", "2"]);
   });
 
   it("fails Telegram cardinality closed", async () => {
-    const result = await parseTargets({
-      TELEGRAM_BOT_TOKEN: "tok-a;tok-b",
-      TELEGRAM_CHAT_ID: "100",
-    });
-    expect(result.targets.filter((t) => t.channel === "telegram")).toEqual([]);
-    expect(result.errors).toEqual([{ channel: "telegram", code: "cardinality_mismatch" }]);
+    const out = await parseTargets({ TELEGRAM_BOT_TOKEN: "ta;tb", TELEGRAM_CHAT_ID: "1" });
+    expect(out.targets.filter((t) => t.channel === "telegram")).toEqual([]);
+    expect(out.errors).toContainEqual({ channel: "telegram", code: "cardinality_mismatch" });
   });
 
-  it("broadcasts one ntfy server/token across N topics", async () => {
-    const result = await parseTargets({
-      NTFY_TOPIC: "alpha;beta",
-      NTFY_SERVER_URL: "https://ntfy.example",
-      NTFY_TOKEN: "secret",
-    });
-    expect(result.targets.filter((t) => t.channel === "ntfy").map((t) => t.config.topic)).toEqual(["alpha", "beta"]);
+  it("broadcasts one ntfy server/token across topics", async () => {
+    const out = await parseTargets({ NTFY_TOPIC: "a;b", NTFY_SERVER_URL: "https://ntfy.example", NTFY_TOKEN: "tk" });
+    const ntfy = out.targets.filter((t) => t.channel === "ntfy");
+    expect(ntfy.map((t) => [t.config.server, t.config.topic, t.config.token])).toEqual([
+      ["https://ntfy.example", "a", "tk"],
+      ["https://ntfy.example", "b", "tk"],
+    ]);
   });
 
-  it("rejects empty semicolon entries and keeps encoded %3B inside values", async () => {
+  it("rejects empty list elements and preserves %3B", async () => {
     const bad = await parseTargets({ SLACK_WEBHOOK_URL: "https://a;;https://b" });
-    expect(bad.errors[0].code).toBe("empty_list_item");
-
-    const good = await parseTargets({ GENERIC_WEBHOOK_URL: "https://x.test/hook?a=x%3By" });
-    expect(good.targets[0].config.url).toBe("https://x.test/hook?a=x%3By");
+    expect(bad.errors).toContainEqual({ channel: "slack", code: "empty_list_item" });
+    const good = await parseTargets({ GENERIC_WEBHOOK_URL: "https://x.test/hook?q=a%3Bb" });
+    expect(good.targets[0].config.url).toBe("https://x.test/hook?q=a%3Bb");
   });
 });
 ```
 
-Run:
+`test/utils/crypto.test.js`:
 
-```bash
-npm test -- test/config/targets.test.js
+```js
+import { expect, it } from "vitest";
+import { constantTimeEqual, sha256Prefix128 } from "../../src/utils/crypto.js";
+
+it("creates 128-bit lowercase hex fingerprints", async () => {
+  expect(await sha256Prefix128("abc")).toMatch(/^[0-9a-f]{32}$/);
+});
+
+it("compares access keys without early length shortcut", () => {
+  expect(constantTimeEqual("secret", "secret")).toBe(true);
+  expect(constantTimeEqual("secret", "secrex")).toBe(false);
+  expect(constantTimeEqual("secret", "short")).toBe(false);
+});
 ```
 
-Expected: FAIL because module does not exist.
+- [ ] **Step 2: Implement crypto helpers**
 
-- [ ] **Step 2: Implement SHA-256 fingerprinting and constant-time string comparison**
-
-Create `src/utils/crypto.js`:
+`src/utils/crypto.js`:
 
 ```js
 export async function sha256Prefix128(value) {
-  const bytes = new TextEncoder().encode(value);
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const data = new TextEncoder().encode(String(value));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
   return [...digest.slice(0, 16)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
@@ -323,51 +305,58 @@ export function constantTimeEqual(a, b) {
 }
 ```
 
-- [ ] **Step 3: Implement deterministic target expansion**
+- [ ] **Step 3: Implement deterministic target parsing**
 
-Create `src/config/targets.js` with these exported helpers and rules:
+`src/config/targets.js`:
 
 ```js
 import { sha256Prefix128 } from "../utils/crypto.js";
 
 function splitList(raw) {
   if (raw == null || raw === "") return [];
-  const parts = raw.split(";").map((v) => v.trim());
-  if (parts.some((v) => v === "")) throw new Error("empty_list_item");
-  return parts;
+  const values = String(raw).split(";").map((v) => v.trim());
+  if (values.some((v) => v === "")) throw new Error("empty_list_item");
+  return values;
 }
 
-async function makeTarget(channel, config, identity) {
-  const hash = await sha256Prefix128(`${channel}\n${identity}`);
+async function makeTarget(channel, config, identityParts) {
+  const hash = await sha256Prefix128([channel, ...identityParts].join("\n"));
   return { id: `${channel}:${hash}`, channel, config };
+}
+
+function expand(values, count, fallback) {
+  if (values.length === 0) return Array(count).fill(fallback);
+  if (values.length === 1) return Array(count).fill(values[0]);
+  if (values.length === count) return values;
+  throw new Error("cardinality_mismatch");
 }
 
 export async function parseTargets(env) {
   const targets = [];
   const errors = [];
 
-  const addWebhookList = async (channel, raw, extra = {}) => {
+  const addWebhook = async (channel, raw, extra = {}) => {
     try {
-      for (const url of splitList(raw)) targets.push(await makeTarget(channel, { url, ...extra }, url));
+      for (const url of splitList(raw)) targets.push(await makeTarget(channel, { url, ...extra }, [url]));
     } catch (error) {
       errors.push({ channel, code: error.message });
     }
   };
 
-  await addWebhookList("wework", env.WEWORK_WEBHOOK_URL, { msgType: env.WEWORK_MSG_TYPE === "text" ? "text" : "markdown" });
-  await addWebhookList("feishu", env.FEISHU_WEBHOOK_URL);
-  await addWebhookList("dingtalk", env.DINGTALK_WEBHOOK_URL);
-  await addWebhookList("bark", env.BARK_URL);
-  await addWebhookList("slack", env.SLACK_WEBHOOK_URL);
-  await addWebhookList("generic-webhook", env.GENERIC_WEBHOOK_URL, { template: env.GENERIC_WEBHOOK_TEMPLATE ?? null });
+  await addWebhook("wework", env.WEWORK_WEBHOOK_URL, { msgType: env.WEWORK_MSG_TYPE === "text" ? "text" : "markdown" });
+  await addWebhook("feishu", env.FEISHU_WEBHOOK_URL);
+  await addWebhook("dingtalk", env.DINGTALK_WEBHOOK_URL);
+  await addWebhook("bark", env.BARK_URL);
+  await addWebhook("slack", env.SLACK_WEBHOOK_URL);
+  await addWebhook("generic-webhook", env.GENERIC_WEBHOOK_URL, { template: env.GENERIC_WEBHOOK_TEMPLATE ?? null });
 
   try {
     const tokens = splitList(env.TELEGRAM_BOT_TOKEN);
     const chats = splitList(env.TELEGRAM_CHAT_ID);
     if (tokens.length || chats.length) {
-      if (!tokens.length || tokens.length !== chats.length) throw new Error("cardinality_mismatch");
+      if (tokens.length === 0 || tokens.length !== chats.length) throw new Error("cardinality_mismatch");
       for (let i = 0; i < tokens.length; i += 1) {
-        targets.push(await makeTarget("telegram", { token: tokens[i], chatId: chats[i] }, `${tokens[i]}\n${chats[i]}`));
+        targets.push(await makeTarget("telegram", { token: tokens[i], chatId: chats[i] }, [tokens[i], chats[i]]));
       }
     }
   } catch (error) {
@@ -377,15 +366,11 @@ export async function parseTargets(env) {
   try {
     const topics = splitList(env.NTFY_TOPIC);
     if (topics.length) {
-      const servers = splitList(env.NTFY_SERVER_URL);
-      const tokens = splitList(env.NTFY_TOKEN);
-      const expand = (values, fallback) => values.length === 0 ? Array(topics.length).fill(fallback) : values.length === 1 ? Array(topics.length).fill(values[0]) : values.length === topics.length ? values : null;
-      const expandedServers = expand(servers, "https://ntfy.sh");
-      const expandedTokens = expand(tokens, null);
-      if (!expandedServers || !expandedTokens) throw new Error("cardinality_mismatch");
+      const servers = expand(splitList(env.NTFY_SERVER_URL), topics.length, "https://ntfy.sh");
+      const tokens = expand(splitList(env.NTFY_TOKEN), topics.length, null);
       for (let i = 0; i < topics.length; i += 1) {
-        const config = { server: expandedServers[i], topic: topics[i], token: expandedTokens[i] };
-        targets.push(await makeTarget("ntfy", config, `${config.server}\n${config.topic}`));
+        const config = { server: servers[i], topic: topics[i], token: tokens[i] };
+        targets.push(await makeTarget("ntfy", config, [config.server, config.topic, config.token ?? ""]));
       }
     }
   } catch (error) {
@@ -396,45 +381,38 @@ export async function parseTargets(env) {
 }
 ```
 
-- [ ] **Step 4: Run tests and lint**
+- [ ] **Step 4: Run tests and commit**
 
 ```bash
-npm test -- test/config/targets.test.js
+npm test -- test/config/targets.test.js test/utils/crypto.test.js
 npm run lint
-```
-
-Expected: PASS; diagnostics contain no raw secrets.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/config/targets.js src/utils/crypto.js test/config/targets.test.js
+git add src/config/targets.js src/utils/crypto.js test/config/targets.test.js test/utils/crypto.test.js
 git commit -m "feat: parse notification targets safely"
 ```
 
 ---
 
-### Task 3: Implement AIHOT fetch, validation, latest-post selection, and source backoff helpers
+### Task 3: AIHOT client, validation, time helpers, and true-latest selection
 
 **Files:**
+- Create: `src/utils/time.js`
 - Create: `src/aihot/client.js`
 - Create: `src/aihot/validate.js`
 - Create: `src/aihot/latest.js`
-- Create: `src/utils/time.js`
 - Create: `test/fixtures/aihot-response.json`
 - Test: `test/aihot/client.test.js`
 - Test: `test/aihot/validate.test.js`
 - Test: `test/aihot/latest.test.js`
 
 **Interfaces:**
-- Produces: `fetchCodexResets({ etag, fetchFn, nowMs })` normalized result.
-- Produces: `validateSnapshot(snapshot)` returning validated snapshot or throwing `SnapshotValidationError`.
-- Produces: `findLatestSourcePost(snapshot) -> { event, post } | null`.
-- Produces: `parseRetryAfter(value, nowMs)` and `sourceBackoffMs(attemptCount)`.
+- `fetchCodexResets({ etag = null, fetchFn = fetch, nowMs = Date.now() })`.
+- `validateSnapshot(snapshot)` throws `SnapshotValidationError` on invalid input.
+- `findLatestSourcePost(snapshot) -> { event, post } | null`.
+- `parseRetryAfter(value, nowMs)` and `sourceBackoffMs(attemptCount)`.
 
-- [ ] **Step 1: Create the regression fixture and failing latest-post test**
+- [ ] **Step 1: Create regression fixture and failing tests**
 
-Create `test/fixtures/aihot-response.json`:
+`test/fixtures/aihot-response.json`:
 
 ```json
 {
@@ -445,10 +423,10 @@ Create `test/fixtures/aihot-response.json`:
   "count": 2,
   "events": [
     {
-      "id": "event-updated-later",
+      "id": "updated-later",
       "type": "reset_credit",
       "status": "confirmed",
-      "title": "Older source post but newer event update",
+      "title": "Older post",
       "scope": "all",
       "updatedAt": "2026-09-12T09:00:00Z",
       "confirmationBasis": "source_post",
@@ -456,10 +434,10 @@ Create `test/fixtures/aihot-response.json`:
       "url": "https://aihot.news/codex-reset/old"
     },
     {
-      "id": "event-real-latest",
+      "id": "real-latest",
       "type": "direct_reset",
       "status": "announced",
-      "title": "Actual newest source post",
+      "title": "Actual latest",
       "scope": "all",
       "updatedAt": "2026-09-12T08:30:00Z",
       "confirmationBasis": null,
@@ -470,35 +448,24 @@ Create `test/fixtures/aihot-response.json`:
 }
 ```
 
-Create `test/aihot/latest.test.js`:
+`test/aihot/latest.test.js`:
 
 ```js
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import fixture from "../fixtures/aihot-response.json" with { type: "json" };
 import { findLatestSourcePost } from "../../src/aihot/latest.js";
 
-it("selects global latest by post.publishedAt, not events[0]", () => {
-  const latest = findLatestSourcePost(fixture);
-  expect(latest.post.id).toBe("post-latest");
-  expect(latest.event.id).toBe("event-real-latest");
+it("selects by post.publishedAt rather than events[0]", () => {
+  expect(findLatestSourcePost(fixture).post.id).toBe("post-latest");
 });
 ```
 
-Run: `npm test -- test/aihot/latest.test.js`.
-Expected: FAIL.
-
-- [ ] **Step 2: Add validation tests**
-
-Create `test/aihot/validate.test.js`:
+`test/aihot/validate.test.js`:
 
 ```js
 import { expect, it } from "vitest";
 import fixture from "../fixtures/aihot-response.json" with { type: "json" };
 import { validateSnapshot } from "../../src/aihot/validate.js";
-
-it("accepts schemaVersion 1", () => {
-  expect(validateSnapshot(structuredClone(fixture)).schemaVersion).toBe(1);
-});
 
 it("rejects incompatible schema", () => {
   expect(() => validateSnapshot({ ...fixture, schemaVersion: 2 })).toThrow(/schema_version/);
@@ -511,15 +478,13 @@ it("rejects conflicting duplicate post ids", () => {
 });
 ```
 
-- [ ] **Step 3: Add conditional-fetch and Retry-After tests**
-
-Create `test/aihot/client.test.js`:
+`test/aihot/client.test.js`:
 
 ```js
-import { describe, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import { fetchCodexResets } from "../../src/aihot/client.js";
 
-it("sends If-None-Match and normalizes 304", async () => {
+it("normalizes 304 and sends ETag", async () => {
   const fetchFn = vi.fn(async (_url, init) => {
     expect(init.headers.get("If-None-Match")).toBe('"abc"');
     return new Response(null, { status: 304 });
@@ -527,21 +492,20 @@ it("sends If-None-Match and normalizes 304", async () => {
   await expect(fetchCodexResets({ etag: '"abc"', fetchFn, nowMs: 0 })).resolves.toEqual({ kind: "not_modified" });
 });
 
-it("returns retryNotBefore for 503 Retry-After", async () => {
+it("honors 503 Retry-After", async () => {
   const fetchFn = vi.fn(async () => new Response("busy", { status: 503, headers: { "Retry-After": "120" } }));
-  const result = await fetchCodexResets({ etag: null, fetchFn, nowMs: 1_000 });
-  expect(result.kind).toBe("source_error");
-  expect(result.status).toBe(503);
-  expect(result.retryNotBefore).toBe(121_000);
+  const out = await fetchCodexResets({ fetchFn, nowMs: 1_000 });
+  expect(out).toMatchObject({ kind: "source_error", status: 503, retryNotBefore: 121_000 });
 });
 ```
 
-- [ ] **Step 4: Implement time helpers, validator, latest selector, and client**
+Run `npm test -- test/aihot` and expect failures.
 
-Use these exact contracts:
+- [ ] **Step 2: Implement time helpers**
+
+`src/utils/time.js`:
 
 ```js
-// src/utils/time.js
 export function parseIsoMs(value) {
   const ms = Date.parse(value);
   if (!Number.isFinite(ms)) throw new Error("invalid_timestamp");
@@ -550,8 +514,9 @@ export function parseIsoMs(value) {
 
 export function parseRetryAfter(value, nowMs) {
   if (!value) return null;
-  if (/^\d+$/.test(value.trim())) return nowMs + Number(value.trim()) * 1000;
-  const absolute = Date.parse(value);
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return nowMs + Number(trimmed) * 1000;
+  const absolute = Date.parse(trimmed);
   return Number.isFinite(absolute) ? absolute : null;
 }
 
@@ -560,13 +525,47 @@ export function sourceBackoffMs(attemptCount) {
 }
 ```
 
+- [ ] **Step 3: Implement snapshot validation**
+
+`src/aihot/validate.js`:
+
 ```js
-// src/aihot/latest.js
+import { parseIsoMs } from "../utils/time.js";
+
+export class SnapshotValidationError extends Error {}
+
+export function validateSnapshot(snapshot) {
+  if (!snapshot || snapshot.schemaVersion !== 1) throw new SnapshotValidationError("schema_version");
+  if (!Array.isArray(snapshot.events)) throw new SnapshotValidationError("events_shape");
+  parseIsoMs(snapshot.checkedAt);
+  const seen = new Map();
+  for (const event of snapshot.events) {
+    if (!Array.isArray(event.posts ?? [])) throw new SnapshotValidationError("posts_shape");
+    if (event.updatedAt) parseIsoMs(event.updatedAt);
+    if (event.confirmedAt) parseIsoMs(event.confirmedAt);
+    for (const post of event.posts ?? []) {
+      if (!post?.id) throw new SnapshotValidationError("post_id");
+      parseIsoMs(post.publishedAt);
+      const fingerprint = JSON.stringify([post.publishedAt, post.text ?? null, post.originalText ?? null, post.url ?? null]);
+      const previous = seen.get(String(post.id));
+      if (previous && previous !== fingerprint) throw new SnapshotValidationError("duplicate_post_conflict");
+      seen.set(String(post.id), fingerprint);
+    }
+  }
+  return snapshot;
+}
+```
+
+- [ ] **Step 4: Implement true-latest selector and AIHOT client**
+
+`src/aihot/latest.js`:
+
+```js
 export function findLatestSourcePost(snapshot) {
   let best = null;
   for (const event of snapshot.events) {
     for (const post of event.posts ?? []) {
-      if (!best || Date.parse(post.publishedAt) > Date.parse(best.post.publishedAt) ||
+      if (!best || post.publishedAt > best.post.publishedAt ||
           (post.publishedAt === best.post.publishedAt && String(post.id) > String(best.post.id))) {
         best = { event, post };
       }
@@ -576,11 +575,33 @@ export function findLatestSourcePost(snapshot) {
 }
 ```
 
-`src/aihot/validate.js` MUST validate schema version, arrays, valid ordering timestamps, and conflicting duplicate IDs before returning the snapshot.
+`src/aihot/client.js`:
 
-`src/aihot/client.js` MUST use `AbortSignal.timeout(10_000)`, set `Accept: application/json`, conditionally set `If-None-Match`, normalize `200`/`304`, and return `retryNotBefore` for any error response carrying valid `Retry-After`.
+```js
+import { parseRetryAfter } from "../utils/time.js";
 
-- [ ] **Step 5: Run AIHOT tests and commit**
+const ENDPOINT = "https://aihot.news/api/v1/codex-resets";
+
+export async function fetchCodexResets({ etag = null, fetchFn = fetch, nowMs = Date.now() } = {}) {
+  const headers = new Headers({ Accept: "application/json" });
+  if (etag) headers.set("If-None-Match", etag);
+  try {
+    const response = await fetchFn(ENDPOINT, { headers, signal: AbortSignal.timeout(10_000) });
+    if (response.status === 304) return { kind: "not_modified" };
+    if (response.status === 200) return { kind: "snapshot", snapshot: await response.json(), etag: response.headers.get("ETag") };
+    return {
+      kind: "source_error",
+      status: response.status,
+      retryNotBefore: parseRetryAfter(response.headers.get("Retry-After"), nowMs),
+      category: `http_${response.status}`,
+    };
+  } catch (error) {
+    return { kind: "source_error", status: null, retryNotBefore: null, category: error?.name === "TimeoutError" ? "timeout" : "network" };
+  }
+}
+```
+
+- [ ] **Step 5: Verify and commit**
 
 ```bash
 npm test -- test/aihot
@@ -591,7 +612,7 @@ git commit -m "feat: add AIHOT client and snapshot validation"
 
 ---
 
-### Task 4: Implement canonical notifications, watermark classification, and receipt-review detection
+### Task 4: Canonical notifications, boundary watermark, and receipt-review signals
 
 **Files:**
 - Create: `src/notification/message.js`
@@ -599,88 +620,150 @@ git commit -m "feat: add AIHOT client and snapshot validation"
 - Test: `test/monitor/signals.test.js`
 
 **Interfaces:**
-- Produces: `buildSourcePostNotification(event, post)`.
-- Produces: `buildReceiptNotification(event, snapshot)`.
-- Produces: `detectSignals({ snapshot, meta, existingReceiptSignals, targetIds }) -> { signals, watermark, diagnostics }`.
+- `buildSourcePostNotification(event, post)`.
+- `buildReceiptNotification(event, snapshot)`.
+- `detectSignals({ snapshot, meta, existingReceiptSignals, targetIds }) -> { signals, watermark, diagnostics, baselineReceiptSignals }`.
 
-- [ ] **Step 1: Write failing batch-watermark tests**
+- [ ] **Step 1: Write failing watermark/receipt tests**
 
-Create `test/monitor/signals.test.js` with:
+`test/monitor/signals.test.js`:
 
 ```js
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { detectSignals } from "../../src/monitor/signals.js";
 
-function post(id, publishedAt) {
-  return { id, publishedAt, text: id, url: `https://example.test/${id}` };
-}
-function event(posts, extra = {}) {
-  return { id: "e", type: "direct_reset", status: "announced", title: "Reset", scope: "all", updatedAt: "2026-09-16T10:00:00Z", confirmationBasis: null, posts, url: "https://aihot.news/e", ...extra };
-}
+const post = (id, publishedAt) => ({ id, publishedAt, text: id, url: `https://example.test/${id}` });
+const event = (posts, extra = {}) => ({
+  id: "e", type: "direct_reset", status: "announced", title: "Reset", scope: "all",
+  updatedAt: "2026-09-16T10:00:00Z", confirmationBasis: null, posts,
+  url: "https://aihot.news/e", ...extra,
+});
 
-it("classifies every post against immutable W0", () => {
+it("uses one immutable W0 for every post in a snapshot", () => {
   const snapshot = { schemaVersion: 1, checkedAt: "2026-09-16T10:30:00Z", events: [event([post("newer", "2026-09-16T10:10:00Z"), post("older-new", "2026-09-16T10:05:00Z")])] };
-  const result = detectSignals({ snapshot, meta: { watermark: { publishedAt: "2026-09-16T10:00:00Z", postIdsAtPublishedAt: ["old"] } }, existingReceiptSignals: [], targetIds: ["wework:a"] });
-  expect(result.signals.map((s) => s.signalId)).toEqual(["post:older-new", "post:newer"]);
+  const out = detectSignals({ snapshot, meta: { watermark: { publishedAt: "2026-09-16T10:00:00Z", postIdsAtPublishedAt: ["old"] } }, existingReceiptSignals: [], targetIds: ["wework:a"] });
+  expect(out.signals.map((s) => s.signalId)).toEqual(["post:older-new", "post:newer"]);
 });
 
-it("discovers a different post id at the exact boundary timestamp", () => {
+it("accepts a new id at the exact boundary timestamp", () => {
   const snapshot = { schemaVersion: 1, checkedAt: "2026-09-16T10:30:00Z", events: [event([post("same-new", "2026-09-16T10:00:00Z")])] };
-  const result = detectSignals({ snapshot, meta: { watermark: { publishedAt: "2026-09-16T10:00:00Z", postIdsAtPublishedAt: ["same-old"] } }, existingReceiptSignals: [], targetIds: [] });
-  expect(result.signals[0].signalId).toBe("post:same-new");
-});
-```
-
-- [ ] **Step 2: Add receipt-review anchor/overlap tests**
-
-Add:
-
-```js
-it("anchors receipt review to earliest source post", () => {
-  const snapshot = { schemaVersion: 1, checkedAt: "2026-09-16T11:00:00Z", events: [event([post("p2", "2026-09-16T09:02:00Z"), post("p1", "2026-09-16T09:01:00Z")], { status: "confirmed", confirmationBasis: "receipt_review", occurredOn: "2026-09-16" })] };
-  const result = detectSignals({ snapshot, meta: { watermark: null }, existingReceiptSignals: [], targetIds: [] });
-  expect(result.signals.find((s) => s.kind === "receipt_review").signalId).toBe("receipt_review:direct_reset:p1");
+  const out = detectSignals({ snapshot, meta: { watermark: { publishedAt: "2026-09-16T10:00:00Z", postIdsAtPublishedAt: ["same-old"] } }, existingReceiptSignals: [], targetIds: [] });
+  expect(out.signals[0].signalId).toBe("post:same-new");
 });
 
-it("suppresses regrouped receipt when source-post sets overlap", () => {
-  const snapshot = { schemaVersion: 1, checkedAt: "2026-09-16T11:00:00Z", events: [event([post("p0", "2026-09-16T08:00:00Z"), post("p1", "2026-09-16T09:01:00Z")], { status: "confirmed", confirmationBasis: "receipt_review" })] };
-  const existingReceiptSignals = [{ signalId: "receipt_review:direct_reset:p1", kind: "receipt_review", receiptAnchorPostIds: ["p1", "p2"] }];
-  const result = detectSignals({ snapshot, meta: { watermark: null }, existingReceiptSignals, targetIds: [] });
-  expect(result.signals.filter((s) => s.kind === "receipt_review")).toHaveLength(0);
+it("anchors receipt review to earliest post and suppresses overlap regrouping", () => {
+  const snapshot = { schemaVersion: 1, checkedAt: "2026-09-16T11:00:00Z", events: [event([post("p2", "2026-09-16T09:02:00Z"), post("p1", "2026-09-16T09:01:00Z")], { status: "confirmed", confirmationBasis: "receipt_review" })] };
+  const first = detectSignals({ snapshot, meta: { watermark: { publishedAt: "2026-09-16T08:00:00Z", postIdsAtPublishedAt: [] } }, existingReceiptSignals: [], targetIds: [] });
+  expect(first.signals.find((s) => s.kind === "receipt_review").signalId).toBe("receipt_review:direct_reset:p1");
+  const second = detectSignals({ snapshot, meta: { watermark: first.watermark }, existingReceiptSignals: first.signals.filter((s) => s.kind === "receipt_review"), targetIds: [] });
+  expect(second.signals.filter((s) => s.kind === "receipt_review")).toHaveLength(0);
 });
 
-it("diagnoses unanchored receipt instead of inventing an id", () => {
+it("diagnoses unanchored receipt", () => {
   const snapshot = { schemaVersion: 1, checkedAt: "2026-09-16T11:00:00Z", events: [event([], { status: "confirmed", confirmationBasis: "receipt_review" })] };
-  const result = detectSignals({ snapshot, meta: { watermark: null }, existingReceiptSignals: [], targetIds: [] });
-  expect(result.diagnostics).toContain("unanchored_receipt_review");
+  const out = detectSignals({ snapshot, meta: { watermark: { publishedAt: "2026-09-16T08:00:00Z", postIdsAtPublishedAt: [] } }, existingReceiptSignals: [], targetIds: [] });
+  expect(out.diagnostics).toContain("unanchored_receipt_review");
 });
 ```
 
-- [ ] **Step 3: Implement deterministic builders and detector**
+- [ ] **Step 2: Implement canonical builders**
 
-`buildSourcePostNotification(event, post)` must copy plain fields and use `schedule.label` as `scheduleLabel` without relabeling it as actual reset time.
-
-`buildReceiptNotification(event, snapshot)` must return:
+`src/notification/message.js`:
 
 ```js
-return {
-  kind: "receipt_review",
-  eventType: event.type,
-  eventStatus: "confirmed",
-  title: event.title,
-  scope: event.scope ?? null,
-  occurredOn: event.occurredOn ?? null,
-  confirmationBasis: "receipt_review",
-  observedAt: snapshot.checkedAt,
-  content: "AIHOT 已通过 receipt review 确认该 Codex 重置事件。",
-  sourceUrl: null,
-  aihotUrl: event.url,
-};
+export function buildSourcePostNotification(event, post) {
+  return {
+    signalId: `post:${post.id}`,
+    kind: "source_post",
+    title: event.title,
+    eventType: event.type,
+    eventStatus: event.status,
+    scope: event.scope ?? null,
+    publishedAt: post.publishedAt,
+    scheduleLabel: event.schedule?.label ?? null,
+    occurredOn: event.occurredOn ?? null,
+    confirmationBasis: event.confirmationBasis ?? null,
+    content: post.text ?? post.originalText ?? "",
+    sourceUrl: post.url ?? null,
+    aihotUrl: event.url ?? null,
+  };
+}
+
+export function buildReceiptNotification(event, snapshot) {
+  return {
+    kind: "receipt_review",
+    eventType: event.type,
+    eventStatus: "confirmed",
+    title: event.title,
+    scope: event.scope ?? null,
+    occurredOn: event.occurredOn ?? null,
+    confirmationBasis: "receipt_review",
+    observedAt: snapshot.checkedAt,
+    content: "AIHOT 已通过 receipt review 确认该 Codex 重置事件。",
+    sourceUrl: null,
+    aihotUrl: event.url ?? null,
+  };
+}
 ```
 
-`detectSignals()` MUST bootstrap with no historical notifications when `meta.watermark == null`, classify every post against entry W0, then compute W1 only after traversal. Signal `discoveredAt` should use `snapshot.checkedAt` for deterministic overlapping processing.
+- [ ] **Step 3: Implement deterministic signal detection**
 
-- [ ] **Step 4: Run tests and commit**
+`src/monitor/signals.js` must implement this control flow exactly:
+
+```js
+import { buildReceiptNotification, buildSourcePostNotification } from "../notification/message.js";
+
+const bySignalOrder = (a, b) => a.sortAt.localeCompare(b.sortAt) || a.signalId.localeCompare(b.signalId);
+
+export function detectSignals({ snapshot, meta, existingReceiptSignals, targetIds }) {
+  const diagnostics = [];
+  const signals = [];
+  const baselineReceiptSignals = [];
+  const w0 = meta?.watermark ?? null;
+  const posts = snapshot.events.flatMap((event) => (event.posts ?? []).map((post) => ({ event, post })));
+
+  for (const { event, post } of posts) {
+    if (w0 !== null) {
+      const newer = post.publishedAt > w0.publishedAt;
+      const sameNewId = post.publishedAt === w0.publishedAt && !w0.postIdsAtPublishedAt.includes(String(post.id));
+      if (newer || sameNewId) {
+        const notification = buildSourcePostNotification(event, post);
+        signals.push({ signalId: notification.signalId, kind: "source_post", discoveredAt: snapshot.checkedAt, sortAt: post.publishedAt, notification, targetIds: [...targetIds] });
+      }
+    }
+  }
+
+  for (const event of snapshot.events) {
+    if (event.status !== "confirmed" || event.confirmationBasis !== "receipt_review") continue;
+    const validPosts = (event.posts ?? []).filter((p) => p.id && p.publishedAt).sort((a, b) => a.publishedAt.localeCompare(b.publishedAt) || String(a.id).localeCompare(String(b.id)));
+    if (!validPosts.length) { diagnostics.push("unanchored_receipt_review"); continue; }
+    const ids = validPosts.map((p) => String(p.id));
+    const alreadyKnown = existingReceiptSignals.some((s) => s.eventType === event.type && s.receiptAnchorPostIds?.some((id) => ids.includes(id)));
+    if (alreadyKnown) continue;
+    const anchorPostId = String(validPosts[0].id);
+    const signal = {
+      signalId: `receipt_review:${event.type}:${anchorPostId}`,
+      kind: "receipt_review",
+      eventType: event.type,
+      anchorPostId,
+      receiptAnchorPostIds: ids,
+      discoveredAt: snapshot.checkedAt,
+      sortAt: event.confirmedAt ?? event.updatedAt ?? snapshot.checkedAt,
+      notification: buildReceiptNotification(event, snapshot),
+      targetIds: w0 === null ? [] : [...targetIds],
+    };
+    if (w0 === null) baselineReceiptSignals.push(signal); else signals.push(signal);
+  }
+
+  const maxPublishedAt = posts.reduce((max, { post }) => max === null || post.publishedAt > max ? post.publishedAt : max, w0?.publishedAt ?? null);
+  const boundaryIds = maxPublishedAt === null ? [] : posts.filter(({ post }) => post.publishedAt === maxPublishedAt).map(({ post }) => String(post.id)).sort();
+  const watermark = maxPublishedAt === null ? w0 : { publishedAt: maxPublishedAt, postIdsAtPublishedAt: boundaryIds };
+  signals.sort(bySignalOrder);
+  return { signals, watermark, diagnostics, baselineReceiptSignals };
+}
+```
+
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 npm test -- test/monitor/signals.test.js
@@ -691,7 +774,7 @@ git commit -m "feat: derive reset signals deterministically"
 
 ---
 
-### Task 5: Implement KV store, physical write contract, migration, and retention
+### Task 5: KV store, physical write discipline, migration, and retention
 
 **Files:**
 - Create: `src/state/kv-store.js`
@@ -699,12 +782,12 @@ git commit -m "feat: derive reset signals deterministically"
 - Test: `test/state/migration.test.js`
 
 **Interfaces:**
-- Produces key helpers: `signalKey`, `deliveryKey`, `targetKey`.
-- Produces store methods: `getMeta`, `putMeta`, `ensureSignal`, `listSignals`, `getDelivery`, `putDelivery`, `get/putTargetRecord`, `get/putSourceBackoff`, `get/putManualLatest`, `putDiagnostics`, `listReceiptSignals`, `migrateToV4`, `pruneTerminalSignals`.
+- `createKvStore(kv)` returns the methods listed below.
+- `signalKey`, `deliveryKey`, `targetKey` are exported for tests/audits.
 
-- [ ] **Step 1: Write failing key/write-discipline tests**
+- [ ] **Step 1: Write failing physical-key tests**
 
-Create `test/state/kv-store.test.js` using a recording fake KV:
+`test/state/kv-store.test.js`:
 
 ```js
 import { expect, it } from "vitest";
@@ -714,7 +797,7 @@ function fakeKv() {
   const data = new Map();
   const writes = [];
   return {
-    writes,
+    data, writes,
     async get(key) { return data.get(key) ?? null; },
     async put(key, value) { writes.push(key); data.set(key, value); },
     async delete(key) { data.delete(key); },
@@ -725,7 +808,7 @@ function fakeKv() {
   };
 }
 
-it("does not write a pending delivery record", async () => {
+it("represents pending by absence", async () => {
   const kv = fakeKv();
   const store = createKvStore(kv);
   await store.ensureSignal({ signalId: "post:1", kind: "source_post", targetIds: ["wework:a"] });
@@ -733,7 +816,7 @@ it("does not write a pending delivery record", async () => {
   expect(await store.getDelivery("post:1", "wework:a")).toBeNull();
 });
 
-it("keeps signal, delivery, meta and diagnostics on separate keys", async () => {
+it("uses separated key families", async () => {
   const kv = fakeKv();
   const store = createKvStore(kv);
   await store.ensureSignal({ signalId: "post:1", kind: "source_post", targetIds: [] });
@@ -744,66 +827,125 @@ it("keeps signal, delivery, meta and diagnostics on separate keys", async () => 
 });
 ```
 
-- [ ] **Step 2: Implement separated KV access**
+- [ ] **Step 2: Implement complete KV store API**
 
-Core helpers:
+`src/state/kv-store.js`:
 
 ```js
-const json = (value) => JSON.stringify(value);
-const parse = (value) => value == null ? null : JSON.parse(value);
-
+const encode = JSON.stringify;
+const decode = (value) => value == null ? null : JSON.parse(value);
 export const signalKey = (signalId) => `signal:${signalId}`;
 export const deliveryKey = (signalId, targetId) => `delivery:${signalId}:${targetId}`;
 export const targetKey = (targetId) => `target:${targetId}`;
 
+async function listAll(kv, prefix) {
+  const names = [];
+  let cursor;
+  do {
+    const page = await kv.list({ prefix, cursor });
+    names.push(...page.keys.map((k) => k.name));
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  } while (cursor);
+  return names;
+}
+
 export function createKvStore(kv) {
   return {
-    async getMeta() { return parse(await kv.get("meta:v4")); },
-    async putMeta(meta) { await kv.put("meta:v4", json(meta)); },
-    async getSignal(signalId) { return parse(await kv.get(signalKey(signalId))); },
+    async getMeta() { return decode(await kv.get("meta:v4")); },
+    async putMeta(value) { await kv.put("meta:v4", encode(value)); },
+    async getSignal(id) { return decode(await kv.get(signalKey(id))); },
     async ensureSignal(signal) {
       const key = signalKey(signal.signalId);
-      const existing = parse(await kv.get(key));
+      const existing = decode(await kv.get(key));
       if (existing) return existing;
-      await kv.put(key, json(signal));
-      return signal;
+      try { await kv.put(key, encode(signal)); return signal; }
+      catch (error) {
+        const converged = decode(await kv.get(key));
+        if (converged) return converged;
+        throw error;
+      }
     },
-    async getDelivery(signalId, targetId) { return parse(await kv.get(deliveryKey(signalId, targetId))); },
-    async putDelivery(signalId, targetId, value) { await kv.put(deliveryKey(signalId, targetId), json(value)); },
-    async putDiagnostics(value) { await kv.put("diag:last", json(value)); },
-    async getSourceBackoff() { return parse(await kv.get("source:backoff")); },
-    async putSourceBackoff(value) { await kv.put("source:backoff", json(value)); },
-    async getManualLatest() { return parse(await kv.get("manual:latest")); },
-    async putManualLatest(value) { await kv.put("manual:latest", json(value)); },
-    // add paginated listSignals/listReceiptSignals and target lifecycle methods here with the same separated-key rule
+    async listSignals() { return Promise.all((await listAll(kv, "signal:")).map(async (key) => decode(await kv.get(key)))); },
+    async listReceiptSignals() { return (await this.listSignals()).filter((s) => s?.kind === "receipt_review"); },
+    async getDelivery(signalId, targetId) { return decode(await kv.get(deliveryKey(signalId, targetId))); },
+    async putDelivery(signalId, targetId, value) { await kv.put(deliveryKey(signalId, targetId), encode(value)); },
+    async deleteDelivery(signalId, targetId) { await kv.delete(deliveryKey(signalId, targetId)); },
+    async getTargetRecord(id) { return decode(await kv.get(targetKey(id))); },
+    async putTargetRecord(id, value) { await kv.put(targetKey(id), encode(value)); },
+    async listTargetRecords() { return Promise.all((await listAll(kv, "target:")).map(async (key) => decode(await kv.get(key)))); },
+    async getSourceBackoff() { return decode(await kv.get("source:backoff")); },
+    async putSourceBackoff(value) { await kv.put("source:backoff", encode(value)); },
+    async clearSourceBackoff() { await kv.delete("source:backoff"); },
+    async getManualLatest() { return decode(await kv.get("manual:latest")); },
+    async putManualLatest(value) { await kv.put("manual:latest", encode(value)); },
+    async getDiagnostics() { return decode(await kv.get("diag:last")); },
+    async putDiagnostics(value) { await kv.put("diag:last", encode(value)); },
+    async deleteSignal(id) { await kv.delete(signalKey(id)); },
   };
 }
 ```
 
-For `ensureSignal`, if `put()` fails because an overlapping writer won, re-read once; if the stable signal now exists, treat it as converged, otherwise rethrow so the caller does not advance `meta:v4`.
+Do not add a method that writes a pending delivery record.
 
-- [ ] **Step 3: Write migration tests**
+- [ ] **Step 3: Add target reconciliation and backlog helpers to the store module**
 
-Create `test/state/migration.test.js` asserting:
+Append these exports:
 
 ```js
-it("baselines V4 without replaying historical signals", async () => {
-  const result = await store.migrateToV4({ legacyState: { stateVersion: 3, seenPostIds: ["old"] }, snapshot, targets: [] });
-  expect(result.createdDeliveryWork).toBe(0);
-  expect(result.diagnostics).toContain("migrated");
-});
+export async function reconcileTargets(store, targets, nowIso) {
+  const active = new Map(targets.map((t) => [t.id, t]));
+  for (const target of targets) {
+    const existing = await store.getTargetRecord(target.id);
+    if (!existing || existing.status !== "active") {
+      await store.putTargetRecord(target.id, { id: target.id, channel: target.channel, status: "active", enabledAt: nowIso, disabledAt: null });
+    }
+  }
+  for (const record of await store.listTargetRecords()) {
+    if (record?.status === "active" && !active.has(record.id)) {
+      await store.putTargetRecord(record.id, { ...record, status: "disabled", disabledAt: nowIso });
+    }
+  }
+  return active;
+}
 
-it("abandons unreconstructable legacy pending intent explicitly", async () => {
-  const result = await store.migrateToV4({ legacyState: { stateVersion: 3, pending: true }, snapshot, targets: [] });
-  expect(result.diagnostics).toContain("legacy_pending_abandoned");
-});
+export async function loadDeliveryWork(store, nowMs) {
+  const work = [];
+  for (const signal of await store.listSignals()) {
+    if (!signal) continue;
+    for (const targetId of signal.targetIds ?? []) {
+      const delivery = await store.getDelivery(signal.signalId, targetId);
+      if (!delivery || (delivery.status === "retry_wait" && delivery.nextAttemptAt <= nowMs)) {
+        work.push({ signalId: signal.signalId, sortAt: signal.sortAt, notification: { ...signal.notification, signalId: signal.signalId }, targetId });
+      }
+    }
+  }
+  return work;
+}
 ```
 
-- [ ] **Step 4: Implement paginated listing, migration and 90-day pruning**
+- [ ] **Step 4: Write and implement migration/retention tests**
 
-`listSignals()` and `listReceiptSignals()` must loop until `list_complete === true`. `pruneTerminalSignals({ nowMs })` deletes only signals older than 90 days whose every target is `sent`, `permanent_failure`, or `disabled`, then deletes their delivery keys.
+`test/state/migration.test.js` must assert two exact outputs:
 
-- [ ] **Step 5: Run tests and commit**
+```js
+expect(await baselineMigrationDiagnostics({ stateVersion: 3, pending: true })).toEqual(["migrated", "legacy_pending_abandoned"]);
+expect(await baselineMigrationDiagnostics(null)).toEqual(["migrated"]);
+```
+
+Implement:
+
+```js
+export async function baselineMigrationDiagnostics(legacyState) {
+  const out = ["migrated"];
+  if (legacyState?.pending || legacyState?.pendingDeliveries?.length) out.push("legacy_pending_abandoned");
+  return out;
+}
+```
+
+Implement `pruneTerminalSignals(store, nowMs)` with `90 * 24 * 60 * 60_000` retention: skip signals without `discoveredAt`, skip younger signals, and delete a signal only when every target has `sent`, `permanent_failure`, or `disabled`; delete its delivery keys before deleting the signal.
+
+- [ ] **Step 5: Verify and commit**
 
 ```bash
 npm test -- test/state
@@ -814,14 +956,14 @@ git commit -m "feat: add KV persistence protocol"
 
 ---
 
-### Task 6: Implement safe text rendering utilities
+### Task 6: Text safety utilities
 
 **Files:**
 - Create: `src/utils/text.js`
 - Test: `test/utils/text.test.js`
 
 **Interfaces:**
-- Produces: `neutralizeMentions`, `escapeHtml`, `escapeMrkdwn`, `safeHttpUrl`, `truncateText`.
+- `neutralizeMentions`, `escapeHtml`, `escapeMrkdwn`, `escapeMarkdown`, `safeHttpUrl`, `truncateText`.
 
 - [ ] **Step 1: Write failing safety tests**
 
@@ -833,16 +975,16 @@ it("neutralizes mass mentions", () => {
   expect(neutralizeMentions("@everyone @channel @here @all")).toBe("＠everyone ＠channel ＠here ＠all");
 });
 
-it("escapes Telegram HTML", () => {
+it("escapes HTML", () => {
   expect(escapeHtml('<b>x & y</b>')).toBe("&lt;b&gt;x &amp; y&lt;/b&gt;");
 });
 
-it("allows only http/https URLs", () => {
+it("filters non-http URLs", () => {
   expect(safeHttpUrl("javascript:alert(1)")).toBeNull();
   expect(safeHttpUrl("https://example.test/x")).toBe("https://example.test/x");
 });
 
-it("truncates with an ellipsis", () => {
+it("truncates deterministically", () => {
   expect(truncateText("abcdef", 5)).toBe("abcd…");
 });
 ```
@@ -853,6 +995,7 @@ it("truncates with an ellipsis", () => {
 export const neutralizeMentions = (text) => String(text ?? "").replace(/@(everyone|channel|here|all)\b/gi, "＠$1");
 export const escapeHtml = (text) => String(text ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 export const escapeMrkdwn = (text) => String(text ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+export const escapeMarkdown = (text) => String(text ?? "").replace(/([\\`*_{}\[\]()#+\-.!|>])/g, "\\$1");
 export function safeHttpUrl(value) {
   try { const url = new URL(value); return ["http:", "https:"].includes(url.protocol) ? url.toString() : null; } catch { return null; }
 }
@@ -862,7 +1005,7 @@ export function truncateText(text, max) {
 }
 ```
 
-- [ ] **Step 3: Run tests and commit**
+- [ ] **Step 3: Verify and commit**
 
 ```bash
 npm test -- test/utils/text.test.js
@@ -873,7 +1016,7 @@ git commit -m "feat: sanitize notification content"
 
 ---
 
-### Task 7: Implement WeCom, Feishu, and DingTalk adapters
+### Task 7: WeCom, Feishu, and DingTalk adapters
 
 **Files:**
 - Create: `src/notification/channels/wework.js`
@@ -882,10 +1025,9 @@ git commit -m "feat: sanitize notification content"
 - Test: `test/notification/channels-cn.test.js`
 
 **Interfaces:**
-- Each module exports `send(target, notification, { fetchFn = fetch } = {}) -> Promise<{ ok, code?, error? }>`.
-- Inputs are canonical plain notifications and parsed target configs.
+- Every adapter exports `send(target, notification, { fetchFn = fetch } = {})` returning `{ ok, retryable?, code?, retryAfterMs?, error? }`.
 
-- [ ] **Step 1: Write failing payload/business-error tests**
+- [ ] **Step 1: Write failing adapter tests**
 
 ```js
 import { expect, it, vi } from "vitest";
@@ -895,70 +1037,75 @@ import { send as sendDingTalk } from "../../src/notification/channels/dingtalk.j
 
 const note = { title: "Reset", content: "hello @all", publishedAt: "2026-09-16T10:00:00Z", sourceUrl: "https://example.test/post" };
 
-it("WeCom validates errcode even on HTTP 200", async () => {
+it("WeCom treats business error as failure", async () => {
   const fetchFn = vi.fn(async (_url, init) => {
-    const body = JSON.parse(init.body);
-    expect(body.msgtype).toBe("markdown");
-    expect(JSON.stringify(body)).not.toContain("@all");
+    expect(JSON.stringify(JSON.parse(init.body))).not.toContain("@all");
     return Response.json({ errcode: 40001, errmsg: "bad" });
   });
-  await expect(sendWeCom({ config: { url: "https://wecom.test", msgType: "markdown" } }, note, { fetchFn })).resolves.toMatchObject({ ok: false });
+  expect((await sendWeCom({ config: { url: "https://wecom.test", msgType: "markdown" } }, note, { fetchFn })).ok).toBe(false);
 });
 
-it("Feishu code 0 is success", async () => {
+it("Feishu code 0 succeeds", async () => {
   const fetchFn = vi.fn(async () => Response.json({ code: 0, msg: "success" }));
-  await expect(sendFeishu({ config: { url: "https://feishu.test" } }, note, { fetchFn })).resolves.toMatchObject({ ok: true });
+  expect((await sendFeishu({ config: { url: "https://feishu.test" } }, note, { fetchFn })).ok).toBe(true);
 });
 
-it("DingTalk nonzero errcode is failure", async () => {
-  const fetchFn = vi.fn(async () => Response.json({ errcode: 310000, errmsg: "keywords not in content" }));
-  await expect(sendDingTalk({ config: { url: "https://ding.test" } }, note, { fetchFn })).resolves.toMatchObject({ ok: false });
+it("DingTalk nonzero errcode fails", async () => {
+  const fetchFn = vi.fn(async () => Response.json({ errcode: 310000, errmsg: "bad" }));
+  expect((await sendDingTalk({ config: { url: "https://ding.test" } }, note, { fetchFn })).ok).toBe(false);
 });
 ```
 
-- [ ] **Step 2: Implement WeCom**
+- [ ] **Step 2: Implement a shared local send pattern in each adapter**
 
-Use POST JSON. Markdown payload:
+Each module should build its own payload but use this exact response classification pattern:
 
 ```js
-{
-  msgtype: "markdown",
-  markdown: { content: renderedText }
+async function postJson(url, body, fetchFn) {
+  try {
+    const response = await fetchFn(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = await response.json().catch(() => null);
+    return { response, data };
+  } catch (error) {
+    return { error, response: null, data: null };
+  }
 }
 ```
 
-Plain text payload when `msgType === "text"`:
+WeCom payload:
 
 ```js
-{
-  msgtype: "text",
-  text: { content: renderedText }
-}
+const body = target.config.msgType === "text"
+  ? { msgtype: "text", text: { content: renderedText } }
+  : { msgtype: "markdown", markdown: { content: renderedMarkdown } };
 ```
 
-Success requires HTTP 2xx **and** `errcode === 0`.
+Success: HTTP 2xx and `data.errcode === 0`.
 
-- [ ] **Step 3: Implement Feishu and DingTalk**
-
-Feishu text payload:
+Feishu payload:
 
 ```js
 { msg_type: "text", content: { text: renderedText } }
 ```
 
-Treat response as success when HTTP is 2xx and either `code === 0` or legacy-compatible `StatusCode === 0`; otherwise normalize failure.
+Success: HTTP 2xx and (`data.code === 0` or `data.StatusCode === 0`).
 
-DingTalk Markdown payload:
+DingTalk payload:
 
 ```js
-{ msgtype: "markdown", markdown: { title: note.title, text: renderedText } }
+{ msgtype: "markdown", markdown: { title: notification.title, text: renderedMarkdown } }
 ```
 
-Success requires HTTP 2xx and `errcode === 0`.
+Success: HTTP 2xx and `data.errcode === 0`.
 
-All three use `AbortSignal.timeout(10_000)`, neutralize mass mentions, filter unsafe URLs, and never include raw exception bodies in returned errors.
+For all three: network/timeout, HTTP 408/429/5xx are retryable; typical 400/401/403/404/410 and platform business errors are non-retryable unless the platform response is a documented rate limit. Do not return raw response bodies.
 
-- [ ] **Step 4: Run tests and commit**
+- [ ] **Step 3: Verify and commit**
 
 ```bash
 npm test -- test/notification/channels-cn.test.js
@@ -969,7 +1116,7 @@ git commit -m "feat: add WeCom Feishu and DingTalk adapters"
 
 ---
 
-### Task 8: Implement Telegram, Bark, ntfy, Slack, and Generic Webhook adapters
+### Task 8: Telegram, Bark, ntfy, Slack, and Generic Webhook adapters
 
 **Files:**
 - Create: `src/notification/channels/telegram.js`
@@ -980,7 +1127,7 @@ git commit -m "feat: add WeCom Feishu and DingTalk adapters"
 - Test: `test/notification/channels-global.test.js`
 
 **Interfaces:**
-- Same normalized `send(target, notification, { fetchFn })` contract as Task 7.
+- Same normalized `send()` result contract as Task 7.
 
 - [ ] **Step 1: Write failing adapter tests**
 
@@ -992,10 +1139,9 @@ import { send as sendGeneric } from "../../src/notification/channels/generic-web
 
 const note = { title: "Reset <now>", content: "hello @everyone", sourceUrl: "https://example.test/post" };
 
-it("Telegram escapes HTML and disables link previews", async () => {
+it("Telegram escapes HTML and disables link preview", async () => {
   const fetchFn = vi.fn(async (_url, init) => {
     const body = JSON.parse(init.body);
-    expect(body.parse_mode).toBe("HTML");
     expect(body.text).toContain("&lt;now&gt;");
     expect(body.link_preview_options).toEqual({ is_disabled: true });
     return Response.json({ ok: true, result: { message_id: 1 } });
@@ -1009,70 +1155,77 @@ it("ntfy uses topic URL and bearer token", async () => {
     expect(init.headers.get("Authorization")).toBe("Bearer tk");
     return new Response("ok", { status: 200 });
   });
-  await sendNtfy({ config: { server: "https://ntfy.example", topic: "topic", token: "tk" } }, note, { fetchFn });
+  expect((await sendNtfy({ config: { server: "https://ntfy.example", topic: "topic", token: "tk" } }, note, { fetchFn })).ok).toBe(true);
 });
 
-it("generic template substitution cannot break JSON structure", async () => {
+it("Generic Webhook substitution cannot inject JSON structure", async () => {
   const fetchFn = vi.fn(async (_url, init) => {
-    expect(() => JSON.parse(init.body)).not.toThrow();
+    const parsed = JSON.parse(init.body);
+    expect(Object.keys(parsed)).toEqual(["message"]);
     return new Response(null, { status: 204 });
   });
   await sendGeneric({ config: { url: "https://hook.test", template: '{"message":"{content}"}' } }, { ...note, content: 'x"},"pwn":true,"x":"' }, { fetchFn });
 });
 ```
 
-- [ ] **Step 2: Implement Telegram**
+- [ ] **Step 2: Implement Telegram, Bark, ntfy, and Slack payloads**
 
-POST to:
-
-```js
-`https://api.telegram.org/bot${target.config.token}/sendMessage`
-```
-
-Body:
+Telegram endpoint/body:
 
 ```js
-{
+const url = `https://api.telegram.org/bot${target.config.token}/sendMessage`;
+const body = {
   chat_id: target.config.chatId,
   text: renderedHtml,
   parse_mode: "HTML",
-  link_preview_options: { is_disabled: true }
-}
+  link_preview_options: { is_disabled: true },
+};
 ```
 
-Success requires HTTP 2xx and `{ ok: true }`.
+Telegram success requires HTTP 2xx and `data.ok === true`.
 
-- [ ] **Step 3: Implement Bark, ntfy, and Slack**
-
-Bark treats configured `BARK_URL` as the full POST endpoint and sends:
+Bark treats `BARK_URL` as full POST endpoint and sends:
 
 ```js
-{ title: note.title, body: renderedText, url: safeHttpUrl(note.sourceUrl) ?? undefined }
+{ title: notification.title, body: renderedText, url: safeHttpUrl(notification.sourceUrl) ?? undefined }
 ```
 
-Treat HTTP 2xx as transport success; if JSON body contains `code`, require `code === 200` or `code === 0`.
+HTTP 2xx is transport success; if JSON contains numeric `code`, require `code === 0 || code === 200`.
 
-ntfy POSTs plain rendered content to `${server-without-trailing-slash}/${encodeURIComponent(topic)}` with `Title` header and optional `Authorization: Bearer <token>`.
+ntfy sends POST to:
 
-Slack Incoming Webhook POSTs:
+```js
+`${target.config.server.replace(/\/$/, "")}/${encodeURIComponent(target.config.topic)}`
+```
+
+with plain-text body, `Title` header, optional `Authorization: Bearer <token>`, and 10-second timeout.
+
+Slack Incoming Webhook sends:
 
 ```js
 { text: renderedMrkdwn }
 ```
 
-HTTP 2xx is success; never forward upstream mass mentions unchanged.
+HTTP 2xx is success. All rendered content passes mention neutralization first.
 
-- [ ] **Step 4: Implement structured Generic Webhook substitution**
+- [ ] **Step 3: Implement structured Generic Webhook substitution**
 
-Parse `GENERIC_WEBHOOK_TEMPLATE` as JSON first. Recursively replace `{title}` and `{content}` **inside string values**, then `JSON.stringify()` the resulting object. With no template, send:
+Use this exact recursion:
 
 ```js
-{ title: note.title, content: renderedText }
+function substitute(value, replacements) {
+  if (typeof value === "string") {
+    return Object.entries(replacements).reduce((out, [key, replacement]) => out.replaceAll(`{${key}}`, replacement), value);
+  }
+  if (Array.isArray(value)) return value.map((item) => substitute(item, replacements));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, substitute(item, replacements)]));
+  return value;
+}
 ```
 
-Invalid template is a non-retryable adapter configuration error and must not expose the template contents.
+Parse `target.config.template` with `JSON.parse()` before substitution. No template means `{ title, content }`. Invalid template returns `{ ok:false, retryable:false, code:"invalid_template" }` without echoing the template.
 
-- [ ] **Step 5: Run tests and commit**
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 npm test -- test/notification/channels-global.test.js
@@ -1083,7 +1236,7 @@ git commit -m "feat: add global notification adapters"
 
 ---
 
-### Task 9: Implement retry classification, target lifecycle, and bounded dispatcher
+### Task 9: Retry policy and bounded dispatcher
 
 **Files:**
 - Create: `src/notification/retry.js`
@@ -1092,51 +1245,42 @@ git commit -m "feat: add global notification adapters"
 - Test: `test/notification/dispatcher.test.js`
 
 **Interfaces:**
-- Produces: `classifyDeliveryResult(result, attemptCount, nowMs)`.
-- Produces: `dispatchDeliveries({ work, targetsById, store, attemptBudget = 10, concurrency = 3, nowMs })`.
-- Consumes adapter map keyed by channel.
+- `deliveryBackoffMs(attemptCount)`.
+- `classifyDeliveryFailure(result, attemptCount, nowMs)`.
+- `dispatchDeliveries({ work, targetsById, store, adapters, attemptBudget = 10, concurrency = 3, nowMs })`.
 
-- [ ] **Step 1: Write retry policy tests**
+- [ ] **Step 1: Write failing retry/dispatcher tests**
+
+`test/notification/retry.test.js`:
 
 ```js
 import { expect, it } from "vitest";
-import { deliveryBackoffMs, classifyDeliveryFailure } from "../../src/notification/retry.js";
+import { classifyDeliveryFailure, deliveryBackoffMs } from "../../src/notification/retry.js";
 
-it("uses 30m exponential delivery backoff capped at 24h", () => {
+it("backs off and makes eighth retry terminal", () => {
   expect(deliveryBackoffMs(1)).toBe(30 * 60_000);
   expect(deliveryBackoffMs(7)).toBe(24 * 60 * 60_000);
-});
-
-it("makes the eighth failed retryable attempt permanent", () => {
   expect(classifyDeliveryFailure({ retryable: true }, 8, 0)).toEqual({ status: "permanent_failure", attemptCount: 8 });
 });
 ```
 
-- [ ] **Step 2: Write dispatcher concurrency/order tests**
-
-Use a fake adapter that records active streams:
+`test/notification/dispatcher.test.js` should construct explicit work:
 
 ```js
-it("never exceeds three target streams and serializes one target", async () => {
-  const starts = [];
-  let active = 0;
-  let maxActive = 0;
-  const send = async (target, note) => {
-    active += 1; maxActive = Math.max(maxActive, active); starts.push(`${target.id}:${note.signalId}`);
-    await Promise.resolve();
-    active -= 1;
-    return { ok: true };
-  };
-  // work contains two signals for target A and one each for B/C/D
-  await dispatchDeliveries({ work, targetsById, store, adapters: { fake: { send } }, attemptBudget: 10, concurrency: 3, nowMs: 0 });
-  expect(maxActive).toBeLessThanOrEqual(3);
-  expect(starts.indexOf("A:post:1")).toBeLessThan(starts.indexOf("A:post:2"));
-});
+const work = [
+  { signalId: "post:1", sortAt: "2026-09-16T10:00:00Z", notification: { signalId: "post:1" }, targetId: "A" },
+  { signalId: "post:2", sortAt: "2026-09-16T10:01:00Z", notification: { signalId: "post:2" }, targetId: "A" },
+  { signalId: "post:1", sortAt: "2026-09-16T10:00:00Z", notification: { signalId: "post:1" }, targetId: "B" },
+  { signalId: "post:1", sortAt: "2026-09-16T10:00:00Z", notification: { signalId: "post:1" }, targetId: "C" },
+  { signalId: "post:1", sortAt: "2026-09-16T10:00:00Z", notification: { signalId: "post:1" }, targetId: "D" },
+];
 ```
 
-Also test: visible `sent` is skipped; removed target becomes `disabled`; retry_wait before `nextAttemptAt` is skipped; budget stops after 10 attempts.
+Use targets `{ id, channel:"fake", config:{} }`, a fake store returning no delivery state, and a fake adapter that records active calls. Assert maximum active calls ≤3 and `A:post:1` starts before `A:post:2`. Add explicit tests for visible `sent`, not-yet-due `retry_wait`, removed target → `disabled`, and attemptBudget=10.
 
-- [ ] **Step 3: Implement retry helpers**
+- [ ] **Step 2: Implement retry helpers**
+
+`src/notification/retry.js`:
 
 ```js
 export function deliveryBackoffMs(attemptCount) {
@@ -1150,11 +1294,62 @@ export function classifyDeliveryFailure(result, attemptCount, nowMs) {
 }
 ```
 
-- [ ] **Step 4: Implement per-target-stream dispatcher**
+- [ ] **Step 3: Implement bounded target-stream dispatcher**
 
-Build `Map<targetId, work[]>`, sort each stream by `(sortAt, signalId)`, and run at most three stream workers. Each stream checks delivery state before send, attempts serially, persists only that pair's outcome, and stops when global attempt budget reaches 10. Never use unbounded `Promise.allSettled(work)`.
+`src/notification/dispatcher.js` core algorithm:
 
-- [ ] **Step 5: Run tests and commit**
+```js
+import { classifyDeliveryFailure } from "./retry.js";
+
+export async function dispatchDeliveries({ work, targetsById, store, adapters, attemptBudget = 10, concurrency = 3, nowMs }) {
+  const streams = new Map();
+  for (const item of work) {
+    if (!streams.has(item.targetId)) streams.set(item.targetId, []);
+    streams.get(item.targetId).push(item);
+  }
+  for (const items of streams.values()) items.sort((a, b) => a.sortAt.localeCompare(b.sortAt) || a.signalId.localeCompare(b.signalId));
+
+  const queue = [...streams.entries()];
+  let attempts = 0;
+  const results = [];
+
+  async function runStream() {
+    while (queue.length && attempts < attemptBudget) {
+      const [targetId, items] = queue.shift();
+      const target = targetsById.get(targetId);
+      for (const item of items) {
+        if (attempts >= attemptBudget) break;
+        const previous = await store.getDelivery(item.signalId, targetId);
+        if (previous?.status === "sent" || previous?.status === "permanent_failure" || previous?.status === "disabled") continue;
+        if (previous?.status === "retry_wait" && previous.nextAttemptAt > nowMs) continue;
+        if (!target) {
+          await store.putDelivery(item.signalId, targetId, { status: "disabled", disabledAt: nowMs });
+          continue;
+        }
+        const adapter = adapters[target.channel];
+        if (!adapter) {
+          await store.putDelivery(item.signalId, targetId, { status: "permanent_failure", attemptCount: (previous?.attemptCount ?? 0) + 1, lastErrorCode: "adapter_missing" });
+          continue;
+        }
+        attempts += 1;
+        const result = await adapter.send(target, item.notification);
+        if (result.ok) {
+          await store.putDelivery(item.signalId, targetId, { status: "sent", sentAt: nowMs, attemptCount: (previous?.attemptCount ?? 0) + 1 });
+        } else {
+          const attemptCount = (previous?.attemptCount ?? 0) + 1;
+          await store.putDelivery(item.signalId, targetId, { ...classifyDeliveryFailure(result, attemptCount, nowMs), lastAttemptAt: nowMs, lastErrorCode: result.code ?? "delivery_failed" });
+        }
+        results.push({ signalId: item.signalId, targetId, ok: result.ok });
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, queue.length || 1) }, () => runStream()));
+  return { attempts, results };
+}
+```
+
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 npm test -- test/notification/retry.test.js test/notification/dispatcher.test.js
@@ -1165,92 +1360,133 @@ git commit -m "feat: add bounded notification dispatcher"
 
 ---
 
-### Task 10: Implement automatic reset monitor and source commit protocol
+### Task 10: Automatic monitor, migration baseline, source commit, and backlog recovery
 
 **Files:**
 - Create: `src/monitor/reset-monitor.js`
+- Modify: `src/state/kv-store.js`
 - Test: `test/monitor/reset-monitor.test.js`
 
 **Interfaces:**
-- Produces: `runResetMonitor({ env, nowMs, fetchFn }) -> diagnostics`.
-- Consumes Tasks 2–5 and 9.
+- `runResetMonitor({ env, nowMs = Date.now(), fetchFn = fetch, adapters, store = createKvStore(env.CODEX_RESET_STATE) }) -> diagnostics`.
+- `buildSourceBackoff(previous, sourceResult, nowMs)`.
 
-- [ ] **Step 1: Write failing commit-order tests**
+- [ ] **Step 1: Write deterministic test harness and failing commit-order tests**
 
-```js
-it("persists every new signal before committing meta", async () => {
-  const calls = [];
-  const store = fakeStore({
-    ensureSignal: async (s) => calls.push(`signal:${s.signalId}`),
-    putMeta: async () => calls.push("meta"),
-  });
-  await runResetMonitor(harness({ store, snapshotWithTwoNewPosts }));
-  expect(calls.indexOf("meta")).toBeGreaterThan(calls.indexOf("signal:post:a"));
-  expect(calls.indexOf("meta")).toBeGreaterThan(calls.indexOf("signal:post:b"));
-});
-
-it("does not advance meta when required signal persistence fails", async () => {
-  const store = fakeStore({ ensureSignal: async () => { throw new Error("kv_write_failed"); } });
-  await expect(runResetMonitor(harness({ store }))).rejects.toThrow(/kv_write_failed/);
-  expect(store.putMeta).not.toHaveBeenCalled();
-});
-```
-
-- [ ] **Step 2: Add 304/backlog and source-backoff tests**
+At the top of `test/monitor/reset-monitor.test.js`, define:
 
 ```js
-it("processes durable retry backlog on AIHOT 304", async () => {
-  const result = await runResetMonitor(harness({ sourceResult: { kind: "not_modified" }, backlog: [pendingWork] }));
-  expect(result.deliveryAttempts).toBe(1);
-});
+import { expect, it, vi } from "vitest";
+import { runResetMonitor } from "../../src/monitor/reset-monitor.js";
 
-it("skips AIHOT while source backoff is active but still processes backlog", async () => {
-  const h = harness({ sourceBackoff: { retryNotBefore: 999_999 }, nowMs: 1_000, backlog: [pendingWork] });
-  await runResetMonitor(h);
-  expect(h.fetchFn).not.toHaveBeenCalled();
-  expect(h.adapter.send).toHaveBeenCalled();
-});
-```
-
-- [ ] **Step 3: Implement orchestration**
-
-`runResetMonitor` order MUST be:
-
-```js
-// conceptual order, preserve exactly
-const { targets, errors } = await parseTargets(env);
-await reconcileTargets(store, targets);
-const sourceBackoff = await store.getSourceBackoff();
-let newSignals = [];
-if (!sourceBackoff || sourceBackoff.retryNotBefore <= nowMs) {
-  const source = await fetchCodexResets({ etag: meta?.etag ?? null, fetchFn, nowMs });
-  // 200: validate → detect against immutable W0 → ensure every signal → putMeta once
-  // 304: clear/reset source failure state
-  // source error: persist source backoff, never advance meta
+function makeStore(overrides = {}) {
+  return {
+    getMeta: vi.fn(async () => ({ stateVersion: 4, etag: '"old"', watermark: { publishedAt: "2026-09-16T10:00:00Z", postIdsAtPublishedAt: [] } })),
+    putMeta: vi.fn(async () => {}),
+    ensureSignal: vi.fn(async (s) => s),
+    listReceiptSignals: vi.fn(async () => []),
+    listSignals: vi.fn(async () => []),
+    getDelivery: vi.fn(async () => null),
+    putDelivery: vi.fn(async () => {}),
+    getSourceBackoff: vi.fn(async () => null),
+    putSourceBackoff: vi.fn(async () => {}),
+    clearSourceBackoff: vi.fn(async () => {}),
+    getTargetRecord: vi.fn(async () => null),
+    putTargetRecord: vi.fn(async () => {}),
+    listTargetRecords: vi.fn(async () => []),
+    putDiagnostics: vi.fn(async () => {}),
+    ...overrides,
+  };
 }
-const work = [...newSignals, ...(await loadEligibleBacklog(store, nowMs))];
-await dispatchDeliveries({ work, targetsById, store, attemptBudget: 10, concurrency: 3, nowMs });
-await store.putDiagnostics(sanitizedDiagnostics);
+
+const snapshot = {
+  schemaVersion: 1,
+  checkedAt: "2026-09-16T10:30:00Z",
+  events: [{ id: "e", type: "direct_reset", status: "announced", title: "Reset", scope: "all", updatedAt: "2026-09-16T10:30:00Z", confirmationBasis: null, posts: [
+    { id: "a", publishedAt: "2026-09-16T10:05:00Z", text: "a", url: "https://example.test/a" },
+    { id: "b", publishedAt: "2026-09-16T10:10:00Z", text: "b", url: "https://example.test/b" }
+  ], url: "https://aihot.news/e" }],
+};
 ```
 
-Ensure source polling occurs before delivery backlog and `diag:last` is written once.
+Test signal writes occur before `putMeta`, and force `ensureSignal` to throw to assert `putMeta` is not called.
 
-- [ ] **Step 4: Add overlap/persistence-failure regression**
+- [ ] **Step 2: Add 304/backoff/backlog tests**
 
-Simulate two executions beginning from the same W0 and one `putMeta` failing/reversing order. Assert stable signal records survive and a later full snapshot converges. Also simulate external send success followed by `putDelivery(sent)` failure; next run may resend, documenting at-least-once behavior.
+Use `makeStore()` with a pending signal returned from `listSignals()`. Mock `fetchFn` to return 304 and an adapter to succeed; assert one delivery attempt occurs. Then set `getSourceBackoff()` to `{ retryNotBefore: 999999 }`, `nowMs:1000`; assert `fetchFn` is not called but backlog delivery still runs.
 
-- [ ] **Step 5: Run tests and commit**
+- [ ] **Step 3: Implement source-backoff builder**
+
+In `src/monitor/reset-monitor.js`:
+
+```js
+import { sourceBackoffMs } from "../utils/time.js";
+
+export function buildSourceBackoff(previous, sourceResult, nowMs) {
+  const attemptCount = (previous?.attemptCount ?? 0) + 1;
+  return {
+    attemptCount,
+    retryNotBefore: sourceResult.retryNotBefore ?? nowMs + sourceBackoffMs(attemptCount),
+    lastStatus: sourceResult.status,
+    lastFailureAt: nowMs,
+    reason: sourceResult.category,
+    updatedAt: nowMs,
+  };
+}
+```
+
+- [ ] **Step 4: Implement monitor control flow**
+
+Use these imports and ordering:
+
+```js
+import { fetchCodexResets } from "../aihot/client.js";
+import { validateSnapshot } from "../aihot/validate.js";
+import { parseTargets } from "../config/targets.js";
+import { dispatchDeliveries } from "../notification/dispatcher.js";
+import { detectSignals } from "./signals.js";
+import { createKvStore, loadDeliveryWork, reconcileTargets } from "../state/kv-store.js";
+```
+
+`runResetMonitor()` MUST:
+
+1. parse targets and reconcile `target:*`;
+2. read `meta:v4` and source backoff;
+3. if no valid V4 meta, fetch a full snapshot with `etag:null`, validate it, call `detectSignals` with no watermark, persist `baselineReceiptSignals` with empty target lists, then commit baseline `meta:v4`; record migration diagnostics and no historical delivery work;
+4. otherwise, when source backoff allows, call AIHOT using current ETag;
+5. on snapshot: validate, load existing receipt signals, call `detectSignals`, `ensureSignal()` every new signal first, then call `putMeta()` exactly once with ETag/W1/checkedAt;
+6. on 304: clear source backoff;
+7. on source error: write one source-backoff record and keep old meta;
+8. load eligible backlog only after source processing;
+9. merge new in-memory signal work with durable backlog by `(signalId,targetId)` dedupe;
+10. dispatch budget=10/concurrency=3;
+11. write `diag:last` exactly once and return it.
+
+Construct new in-memory work as:
+
+```js
+const workForSignal = (signal) => signal.targetIds.map((targetId) => ({
+  signalId: signal.signalId,
+  sortAt: signal.sortAt,
+  notification: { ...signal.notification, signalId: signal.signalId },
+  targetId,
+}));
+```
+
+- [ ] **Step 5: Add overlap and sent-persistence-failure regressions, then commit**
+
+Test two monitor calls sharing a fake KV snapshot where the first `putMeta` succeeds and the second simulates stale W0/reversed meta commit; assert stable `signal:post:a`/`signal:post:b` remain and a third full snapshot converges. Test adapter success followed by `putDelivery` throwing; assert the next run can attempt again, matching at-least-once semantics.
 
 ```bash
 npm test -- test/monitor/reset-monitor.test.js
 npm run lint
-git add src/monitor/reset-monitor.js test/monitor/reset-monitor.test.js
+git add src/monitor/reset-monitor.js src/state/kv-store.js test/monitor/reset-monitor.test.js
 git commit -m "feat: orchestrate Codex reset monitoring"
 ```
 
 ---
 
-### Task 11: Implement public status/health routes and authenticated `GET /latest`
+### Task 11: Status/health and authenticated mobile `GET /latest`
 
 **Files:**
 - Create: `src/routes/status.js`
@@ -1260,56 +1496,109 @@ git commit -m "feat: orchestrate Codex reset monitoring"
 - Test: `test/routes/latest.test.js`
 
 **Interfaces:**
-- Produces: `handleStatus(request, env)` and `handleHealth(request, env)`.
-- Produces: `handleLatest(request, env, { fetchFn = fetch, nowMs = Date.now() } = {})`.
+- `handleStatus(request, env, deps)`.
+- `handleHealth(request, env, deps)`.
+- `handleLatest(request, env, { fetchFn = fetch, nowMs = Date.now(), adapters, store = createKvStore(env.CODEX_RESET_STATE) } = {})`.
 
 - [ ] **Step 1: Write failing route-security tests**
 
 ```js
-it("rejects missing latest key before any external request", async () => {
+import { expect, it, vi } from "vitest";
+import { handleLatest } from "../../src/routes/latest.js";
+
+const env = { LATEST_ACCESS_KEY: "secret" };
+
+it("rejects missing key before external requests", async () => {
   const fetchFn = vi.fn();
-  const response = await handleLatest(new Request("https://worker.test/latest"), env, { fetchFn, nowMs: 0 });
+  const response = await handleLatest(new Request("https://worker.test/latest"), env, { fetchFn, store: fakeStore(), adapters: {} });
   expect(response.status).toBe(403);
   expect(fetchFn).not.toHaveBeenCalled();
 });
 
 it("HEAD and prefetch never cause side effects", async () => {
   const fetchFn = vi.fn();
-  expect((await handleLatest(new Request("https://worker.test/latest?key=k", { method: "HEAD" }), env, { fetchFn })).status).toBe(405);
-  expect((await handleLatest(new Request("https://worker.test/latest?key=k", { headers: { "Sec-Purpose": "prefetch" } }), env, { fetchFn })).status).toBe(204);
+  expect((await handleLatest(new Request("https://worker.test/latest?key=secret", { method: "HEAD" }), env, { fetchFn, store: fakeStore(), adapters: {} })).status).toBe(405);
+  expect((await handleLatest(new Request("https://worker.test/latest?key=secret", { headers: { "Sec-Purpose": "prefetch" } }), env, { fetchFn, store: fakeStore(), adapters: {} })).status).toBe(204);
   expect(fetchFn).not.toHaveBeenCalled();
 });
 ```
 
-- [ ] **Step 2: Add fresh-AIHOT/latest-selection/state-isolation tests**
+Define `fakeStore()` in the same test file with `getManualLatest`, `putManualLatest`, `getSourceBackoff`, `putSourceBackoff`, `clearSourceBackoff`, `getDiagnostics`, `listSignals`, and no-op methods required by the route.
 
-Test a valid key where AIHOT fixture's `events[0]` is not global latest. Assert the adapter receives `post-latest`; assert `putMeta`, `ensureSignal`, and automatic `putDelivery` are never called. Add 10-second cooldown and active source-backoff tests that assert AIHOT is not fetched.
+- [ ] **Step 2: Add valid-key full-path tests**
 
-- [ ] **Step 3: Implement `/latest` guard sequence exactly**
+Use the Task 3 fixture and a fake adapter target. Assert:
 
 ```js
-export async function handleLatest(request, env, deps = {}) {
-  const fetchFn = deps.fetchFn ?? fetch;
-  const nowMs = deps.nowMs ?? Date.now();
-  const purpose = `${request.headers.get("Sec-Purpose") ?? ""} ${request.headers.get("Purpose") ?? ""}`.toLowerCase();
-  if (request.method === "HEAD") return new Response(null, { status: 405, headers: { Allow: "GET" } });
-  if (purpose.includes("prefetch") || purpose.includes("prerender")) return new Response(null, { status: 204 });
-  if (request.method !== "GET") return new Response(null, { status: 405, headers: { Allow: "GET" } });
-
-  const url = new URL(request.url);
-  if (!constantTimeEqual(url.searchParams.get("key"), env.LATEST_ACCESS_KEY)) return privateJson({ ok: false, reason: "forbidden" }, 403);
-
-  // then manual cooldown → source backoff → fresh AIHOT fetch → validate → global latest → parse targets → bounded send
-}
+expect(sentNotification.signalId).toBe("post:post-latest");
+expect(store.putMeta).not.toHaveBeenCalled();
+expect(store.ensureSignal).not.toHaveBeenCalled();
+expect(store.putDelivery).not.toHaveBeenCalled();
 ```
 
-`privateJson()` MUST add `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, and `X-Robots-Tag: noindex, nofollow` to every `/latest` response.
+Add cooldown (`lastAcceptedAt` <10s) and active source-backoff tests that assert `fetchFn` is never called. Assert all `/latest` responses carry `Cache-Control:no-store`, `Referrer-Policy:no-referrer`, `X-Robots-Tag:noindex, nofollow`.
 
-- [ ] **Step 4: Implement status/health and route dispatch**
+- [ ] **Step 3: Implement private response and guard sequence**
 
-`GET /` returns sanitized service/source/schedule/last-check/target-count/pending counts only. `GET /health` returns minimal sanitized health. Unknown paths return 404. `src/index.js` routes `/`, `/health`, `/latest` and calls `runResetMonitor()` from `scheduled()` via `ctx.waitUntil()`.
+`src/routes/latest.js` starts with:
 
-- [ ] **Step 5: Run route tests and commit**
+```js
+import { fetchCodexResets } from "../aihot/client.js";
+import { findLatestSourcePost } from "../aihot/latest.js";
+import { validateSnapshot } from "../aihot/validate.js";
+import { parseTargets } from "../config/targets.js";
+import { constantTimeEqual } from "../utils/crypto.js";
+import { buildSourcePostNotification } from "../notification/message.js";
+import { createKvStore } from "../state/kv-store.js";
+
+const privateHeaders = {
+  "content-type": "application/json; charset=utf-8",
+  "cache-control": "no-store",
+  "referrer-policy": "no-referrer",
+  "x-robots-tag": "noindex, nofollow",
+};
+const privateJson = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: privateHeaders });
+```
+
+Guard order:
+
+```js
+const purpose = `${request.headers.get("Sec-Purpose") ?? ""} ${request.headers.get("Purpose") ?? ""}`.toLowerCase();
+if (request.method === "HEAD") return new Response(null, { status: 405, headers: { ...privateHeaders, Allow: "GET" } });
+if (purpose.includes("prefetch") || purpose.includes("prerender")) return new Response(null, { status: 204, headers: privateHeaders });
+if (request.method !== "GET") return new Response(null, { status: 405, headers: { ...privateHeaders, Allow: "GET" } });
+const url = new URL(request.url);
+if (!constantTimeEqual(url.searchParams.get("key"), env.LATEST_ACCESS_KEY)) return privateJson({ ok: false, reason: "forbidden" }, 403);
+```
+
+Then check `manual:latest`; check `source:backoff`; write `manual:latest` immediately before the fresh AIHOT fetch; fetch with `etag:null`; on source error update shared source-backoff operational state; on 200 validate snapshot, find global latest, parse current targets, build source notification, and send to all targets with a dedicated one-notification helper using at most 3 concurrent promises. Do not call automatic `putMeta`, `ensureSignal`, or `putDelivery`.
+
+- [ ] **Step 4: Implement sanitized status/health and Worker routing**
+
+`src/routes/status.js` should parse current targets only for channel counts/errors, read `meta:v4`/`diag:last`, and return fields limited to service/version/source/schedule/check timestamps/channel counts/pending categories. Never serialize target objects or raw errors.
+
+`src/index.js`:
+
+```js
+import { handleHealth, handleStatus } from "./routes/status.js";
+import { handleLatest } from "./routes/latest.js";
+import { runResetMonitor } from "./monitor/reset-monitor.js";
+
+export default {
+  async fetch(request, env) {
+    const { pathname } = new URL(request.url);
+    if (pathname === "/") return handleStatus(request, env);
+    if (pathname === "/health") return handleHealth(request, env);
+    if (pathname === "/latest") return handleLatest(request, env);
+    return Response.json({ ok: false, reason: "not_found" }, { status: 404 });
+  },
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(runResetMonitor({ env }));
+  },
+};
+```
+
+- [ ] **Step 5: Verify and commit**
 
 ```bash
 npm test -- test/routes
@@ -1320,85 +1609,82 @@ git commit -m "feat: add status health and latest routes"
 
 ---
 
-### Task 12: Add Worker-runtime integration tests with real local KV binding
+### Task 12: Worker-runtime integration tests
 
 **Files:**
 - Create: `test/integration/worker.test.js`
 
 **Interfaces:**
-- Uses Cloudflare Vitest runtime `env` and Worker handler.
-- Verifies local KV behavior through `env.CODEX_RESET_STATE`.
+- Uses `env` from `cloudflare:workers` and local simulated KV from `@cloudflare/vitest-plugin`.
 
-- [ ] **Step 1: Write integration test for KV-separated state**
+- [ ] **Step 1: Write a real-KV separation test**
 
 ```js
 import { env } from "cloudflare:workers";
 import { beforeEach, expect, it } from "vitest";
-import worker from "../../src/index.js";
+import { createKvStore } from "../../src/state/kv-store.js";
 
 beforeEach(async () => {
-  const listed = await env.CODEX_RESET_STATE.list();
-  await Promise.all(listed.keys.map((k) => env.CODEX_RESET_STATE.delete(k.name)));
+  let cursor;
+  do {
+    const page = await env.CODEX_RESET_STATE.list({ cursor });
+    await Promise.all(page.keys.map((k) => env.CODEX_RESET_STATE.delete(k.name)));
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  } while (cursor);
 });
 
-it("status route never exposes stored secret-like values", async () => {
-  await env.CODEX_RESET_STATE.put("diag:last", JSON.stringify({ status: "ok" }));
-  const response = await worker.fetch(new Request("https://worker.test/"), env, {});
-  const body = await response.text();
-  expect(body).not.toContain("webhook");
-  expect(body).not.toContain("token");
+it("stores signal and delivery on separate physical keys", async () => {
+  const store = createKvStore(env.CODEX_RESET_STATE);
+  await store.ensureSignal({ signalId: "post:1", kind: "source_post", targetIds: ["wework:a"] });
+  expect(await env.CODEX_RESET_STATE.get("delivery:post:1:wework:a")).toBeNull();
+  await store.putDelivery("post:1", "wework:a", { status: "sent" });
+  expect(await env.CODEX_RESET_STATE.get("signal:post:1")).not.toBeNull();
+  expect(await env.CODEX_RESET_STATE.get("delivery:post:1:wework:a")).not.toBeNull();
+  expect(await env.CODEX_RESET_STATE.get("state:v4")).toBeNull();
 });
 ```
 
-- [ ] **Step 2: Add integration test for pending-by-absence**
+- [ ] **Step 2: Add status secret-leak test**
 
-Persist one `signal:*` directly, assert its `delivery:*` key is absent, invoke monitor with mocked adapter/source, then assert only the per-target delivery key appears—not a monolithic `state:v4` key.
+Invoke the exported Worker on `/` with test-only env values and assert response text does not contain webhook URL, Telegram token, `LATEST_ACCESS_KEY`, or target hash. Populate `diag:last` with sanitized data first.
 
-- [ ] **Step 3: Add integration test for `/latest` headers and no automatic-state mutation**
+- [ ] **Step 3: Add automatic-state isolation test for `/latest`**
 
-Invoke `worker.fetch()` with test secret, mocked outbound source/adapter injection exposed through a test-only dependency factory or direct route import. Assert privacy headers and unchanged `meta:v4`/`signal:*` keys.
+Import `handleLatest` directly with injected `fetchFn`, fake adapters, and real `createKvStore(env.CODEX_RESET_STATE)`. Seed `meta:v4`, invoke a valid-key request, and assert the exact original `meta:v4` remains byte-for-byte unchanged and no new `signal:*`/`delivery:*` keys appear.
 
-- [ ] **Step 4: Run full suite**
+- [ ] **Step 4: Run integration/full suite and commit**
 
 ```bash
 npm test
 npm run lint
-```
-
-Expected: all unit and Worker-runtime integration tests PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add test/integration
+git add test/integration/worker.test.js
 git commit -m "test: cover Worker runtime and KV integration"
 ```
 
 ---
 
-### Task 13: Add README docs, MIT license, and CI
+### Task 13: CI, license, and bilingual deployment documentation
 
 **Files:**
+- Create: `.github/workflows/ci.yml`
+- Create: `LICENSE`
 - Create: `README.md`
 - Create: `README_EN.md`
-- Create: `LICENSE`
-- Create: `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Produces deploy/operator documentation matching the approved spec.
+- Produces user-facing deploy/operator contract matching the approved spec.
 
-- [ ] **Step 1: Add CI first and verify it runs only quality checks**
+- [ ] **Step 1: Add CI**
 
-Create `.github/workflows/ci.yml`:
+`.github/workflows/ci.yml`:
 
 ```yaml
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -1417,41 +1703,40 @@ No Cloudflare token and no deploy step.
 
 - [ ] **Step 2: Add MIT license**
 
-Create `LICENSE` with the standard MIT text, copyright year `2026`, copyright holder `LewLIu`.
+Use standard MIT License text with year `2026` and copyright holder `LewLIu`.
 
-- [ ] **Step 3: Write Chinese README with exact deploy/security workflow**
+- [ ] **Step 3: Write `README.md` with exact operator workflow**
 
-README MUST include these concrete commands:
+Include these commands:
 
 ```bash
 npm install
 npx wrangler login
 npx wrangler secret put LATEST_ACCESS_KEY
-npx wrangler secret put WEWORK_WEBHOOK_URL   # only if WeCom is used
 npx wrangler deploy
 ```
 
-Explain that `wrangler.jsonc` uses KV automatic provisioning; first deploy creates/writes the namespace binding if not already provisioned. Document all channel variables, semicolon/cardinality rules, Cron, source backoff, delivery retry, migration, at-least-once duplicate windows, and AIHOT usage boundary.
+Then list every channel secret name and exact semicolon/cardinality rules. Explain Wrangler KV automatic provisioning from the binding-only `wrangler.jsonc`. Document Cron, source backoff, delivery retry, concurrency=3, budget=10, at-least-once duplicate windows, V3→V4 baseline migration, and AIHOT licensing/attribution boundary.
 
-Include mobile test example:
+For a mobile bookmark, show the concrete shape without inventing a deployment hostname:
 
 ```text
-https://<your-worker>.workers.dev/latest?key=<your-random-256-bit-key>
+https://YOUR_WORKER_SUBDOMAIN.workers.dev/latest?key=YOUR_256_BIT_RANDOM_KEY
 ```
 
-State explicitly that the complete bookmark URL is a secret capability and must be rotated if disclosed.
+Explicitly state that the complete bookmarked URL is a secret capability and must be rotated if exposed.
 
-- [ ] **Step 4: Write English README with the same normative content**
+- [ ] **Step 4: Write `README_EN.md` with the same normative constraints**
 
-Do not translate away constraints: keep exact env names, 30-minute Cron, concurrency=3, attempt budget=10, migration behavior, and AIHOT attribution/licensing boundary.
+Keep exact environment-variable names, Cron schedule, concurrency/budget numbers, migration behavior, security model, and AIHOT attribution/licensing boundary.
 
-- [ ] **Step 5: Run local quality checks and commit**
+- [ ] **Step 5: Verify and commit**
 
 ```bash
 npm test
 npm run lint
 npx wrangler deploy --dry-run
-git add README.md README_EN.md LICENSE .github/workflows/ci.yml
+git add .github/workflows/ci.yml LICENSE README.md README_EN.md
 git commit -m "docs: add deployment guide license and CI"
 ```
 
@@ -1460,12 +1745,12 @@ git commit -m "docs: add deployment guide license and CI"
 ### Task 14: Final verification against the approved spec
 
 **Files:**
-- Modify only files required by failures found in this verification.
+- Modify only files implicated by a failing verification check.
 
 **Interfaces:**
-- Produces: implementation ready for deployment, with evidence that all approved design invariants are covered.
+- Produces a deployable V1 with evidence for all spec invariants.
 
-- [ ] **Step 1: Run all automated checks**
+- [ ] **Step 1: Run complete verification**
 
 ```bash
 npm ci
@@ -1474,9 +1759,9 @@ npm run lint
 npx wrangler deploy --dry-run
 ```
 
-Expected: all PASS.
+Expected: all pass.
 
-- [ ] **Step 2: Run targeted regression tests individually**
+- [ ] **Step 2: Run critical regressions individually**
 
 ```bash
 npm test -- test/aihot/latest.test.js
@@ -1488,47 +1773,42 @@ npm test -- test/routes/latest.test.js
 npm test -- test/integration/worker.test.js
 ```
 
-Expected: all PASS.
+Expected: all pass.
 
-- [ ] **Step 3: Audit the physical KV contract**
-
-Search:
+- [ ] **Step 3: Audit KV physical writes**
 
 ```bash
 grep -R "state:v4\|pending:index\|sleep(1000)" -n src test || true
+grep -R "CODEX_RESET_STATE.put" -n src test || true
 ```
 
-Expected: no implementation of a monolithic `state:v4`, no hot `pending:index`, and no sleep workaround.
+Expected: no monolithic `state:v4`, no `pending:index`, no sleep workaround. Any direct KV writes must map to approved key families: `meta:v4`, `signal:*`, `delivery:*`, `target:*`, `source:backoff`, `manual:latest`, `diag:last`.
 
-Also inspect all `CODEX_RESET_STATE.put`/store writes and confirm they map only to the approved key families: `meta:v4`, `signal:*`, `delivery:*`, `target:*`, `source:backoff`, `manual:latest`, `diag:last`.
-
-- [ ] **Step 4: Audit secret handling**
+- [ ] **Step 4: Audit secrets**
 
 ```bash
 grep -R "LATEST_ACCESS_KEY\|WEBHOOK_URL\|BOT_TOKEN\|NTFY_TOKEN" -n . --exclude-dir=node_modules --exclude=package-lock.json
 ```
 
-Expected: only source/docs/config-name references; no real credential values. Confirm `.env*` and `.dev.vars*` are ignored.
+Expected: only code/docs/config-name references; no real credentials. Confirm `.env*` and `.dev.vars*` are ignored.
 
-- [ ] **Step 5: Commit any verification-only fixes, otherwise record the clean result**
+- [ ] **Step 5: Commit only real fixes**
 
-If fixes were required:
+If verification changed files:
 
 ```bash
 git add -A
 git commit -m "fix: close final relay verification gaps"
 ```
 
-If no fixes were required, do not create an empty commit.
+If verification is clean, do not create an empty commit.
 
 ---
 
 ## Self-Review Checklist
 
-Before execution begins, the plan author verified:
-
-- **Spec coverage:** every approved section is represented: AIHOT semantics, key-level KV contract, receipt anchoring, boundary watermark, commit order, target lifecycle/config cardinality, retry/backoff, bounded concurrency, eight adapters, untrusted rendering, `/latest`, migration, retention, diagnostics, CI/docs/security.
-- **Physical KV coverage:** tests explicitly assert missing delivery key = pending, separated key families, signal-before-meta ordering, persistence-failure behavior, and overlapping-execution convergence.
-- **No placeholder scan:** no `TBD`, `TODO`, “similar to Task N”, or unresolved function/type names remain.
-- **Interface consistency:** `parseTargets`, `fetchCodexResets`, `validateSnapshot`, `findLatestSourcePost`, `detectSignals`, `createKvStore`, `dispatchDeliveries`, `runResetMonitor`, and route handlers have one stable naming contract across tasks.
-- **Current Cloudflare testing stack:** plan uses Wrangler 4 and the current `@cloudflare/vitest-plugin` with Vitest 4.1+ rather than the older `@cloudflare/vitest-pool-workers` integration.
+- **Spec coverage:** AIHOT semantics, KV physical contract, receipt anchoring, boundary watermark, commit ordering, target lifecycle/cardinality, retries/backoff, bounded concurrency, all eight adapters, untrusted rendering, `/latest`, migration, retention, diagnostics, CI/docs/security all map to explicit tasks.
+- **Placeholder scan:** no `TBD`, `TODO`, “similar to Task N”, undefined test harness names, or “implement later” instructions remain.
+- **Type/name consistency:** `parseTargets`, `fetchCodexResets`, `validateSnapshot`, `findLatestSourcePost`, `detectSignals`, `createKvStore`, `reconcileTargets`, `loadDeliveryWork`, `dispatchDeliveries`, `runResetMonitor`, `handleStatus`, `handleHealth`, and `handleLatest` are stable across tasks.
+- **Current Cloudflare stack:** Wrangler 4 + Vitest 4.1+ + `@cloudflare/vitest-plugin`, not the legacy `@cloudflare/vitest-pool-workers` integration.
+- **TDD:** every implementation task starts with a failing test, then minimal implementation, verification, and a focused commit.
