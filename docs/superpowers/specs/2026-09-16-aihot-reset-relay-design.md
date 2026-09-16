@@ -1,12 +1,12 @@
-# AIHOT Reset Relay — Design Specification
+# AIHOT Codex Reset Relay — Design Specification
 
 Date: 2026-09-16
 Status: Approved design baseline
-Repository: `LewLIu/aihot-reset-relay`
+Repository: `LewLIu/aihot-codex-reset-relay`
 
 ## 1. Purpose
 
-AIHOT Reset Relay is a self-hosted Cloudflare Workers project that monitors AIHOT's public Codex Reset API and relays new Codex reset information to user-configured notification channels.
+AIHOT Codex Reset Relay is a self-hosted Cloudflare Workers project that monitors AIHOT's public Codex Reset API and relays new Codex reset information to user-configured notification channels.
 
 The project does **not** collect posts from X/Twitter, independently determine whether a Codex reset happened, mirror AIHOT's API, or provide a hosted SaaS service. AIHOT is the upstream source of structured Codex Reset data; this project is responsible for polling, state tracking, deduplication, delivery retries, and channel-specific notification formatting.
 
@@ -19,7 +19,7 @@ Tibo / upstream sources
         ↓
 AIHOT Codex Reset API
         ↓
-aihot-reset-relay
+aihot-codex-reset-relay
         ↓
 WeCom / Feishu / DingTalk / Telegram / Bark / ntfy / Slack / Generic Webhook
 ```
@@ -518,7 +518,7 @@ Healthy example:
 ```json
 {
   "ok": true,
-  "service": "aihot-reset-relay"
+  "service": "aihot-codex-reset-relay"
 }
 ```
 
