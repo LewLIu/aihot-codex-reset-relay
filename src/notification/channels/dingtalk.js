@@ -1,0 +1,3 @@
+import { plainText } from "../../utils/text.js";
+import { httpFailure, safeJson, timeoutSignal, retryAfterMs } from "./_shared.js";
+export async function send(target,note,{fetchFn=fetch}={}){try{const r=await fetchFn(target.config.url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({msgtype:"markdown",markdown:{title:String(note.title??"Codex Reset"),text:plainText(note)}}),signal:timeoutSignal()});if(!r.ok)return{...httpFailure(r.status),retryAfterMs:retryAfterMs(r)};const j=await safeJson(r);return j?.errcode===0?{ok:true}:{ok:false,retryable:false,code:"dingtalk_business_error"};}catch(e){return{ok:false,retryable:true,code:e?.name==="TimeoutError"?"timeout":"network"};}}
