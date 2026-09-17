@@ -14,7 +14,7 @@ export async function fetchCodexResets({ etag = null, fetchFn = fetch, nowMs = D
   if (response.status === 304) return { kind: "not_modified" };
   if (response.status === 200) {
     try {
-      return { kind: "ok", snapshot: await response.json(), etag: response.headers.get("ETag") };
+      return { kind: "snapshot", snapshot: await response.json(), etag: response.headers.get("ETag") };
     } catch {
       return { kind: "source_error", status: 200, code: "invalid_json" };
     }
