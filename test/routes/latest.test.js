@@ -1,0 +1,4 @@
+import {expect,it,vi} from "vitest";import {handleLatest} from "../../src/routes/latest.js";
+function store(){return{async getManualLatest(){return null},async putManualLatest(){},async getSourceBackoff(){return null},async putSourceBackoff(){}};}
+it("rejects bad key before upstream",async()=>{const fetchFn=vi.fn();const r=await handleLatest(new Request("https://w/latest?key=x"),{LATEST_ACCESS_KEY:"secret"},{fetchFn,store:store(),nowMs:0});expect(r.status).toBe(403);expect(fetchFn).not.toHaveBeenCalled();});
+it("HEAD and prefetch are side-effect free",async()=>{const fetchFn=vi.fn();expect((await handleLatest(new Request("https://w/latest?key=secret",{method:"HEAD"}),{LATEST_ACCESS_KEY:"secret"},{fetchFn,store:store()})).status).toBe(204);expect((await handleLatest(new Request("https://w/latest?key=secret",{headers:{"Sec-Purpose":"prefetch"}}),{LATEST_ACCESS_KEY:"secret"},{fetchFn,store:store()})).status).toBe(204);expect(fetchFn).not.toHaveBeenCalled();});

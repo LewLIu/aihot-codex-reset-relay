@@ -1,0 +1,2 @@
+import {expect,it} from "vitest";import {handleStatus} from "../../src/routes/status.js";
+it("does not serialize secrets",async()=>{const store={async getMeta(){return null},async getDiagnostics(){return null},async listSignals(){return[]},async getDelivery(){return null}};const r=await handleStatus(new Request("https://w/"),{WEWORK_WEBHOOK_URL:"https://secret.example/key",LATEST_ACCESS_KEY:"topsecret"},{store});const text=await r.text();expect(text).not.toContain("secret.example");expect(text).not.toContain("topsecret");});
