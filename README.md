@@ -21,7 +21,7 @@ Cron 为 `*/30 * * * *`，KV binding 为 `CODEX_RESET_STATE`。
 https://YOUR_WORKER.workers.dev/latest?key=YOUR_256_BIT_RANDOM_KEY
 ```
 
-完整收藏 URL 本身就是凭证；泄露后必须轮换 `LATEST_ACCESS_KEY`。`/latest` 仍是 GET，但 HEAD、prefetch/prerender、错误 key、10 秒 cooldown、AIHOT source backoff 都会在任何外部请求前拦截。
+完整收藏 URL 本身就是凭证；泄露后必须轮换 `LATEST_ACCESS_KEY`。`/latest` 仍是 GET，但 HEAD、prefetch/prerender、错误 key、10 秒 cooldown、AIHOT source backoff 都会在任何外部请求前拦截。`wrangler.jsonc` 已启用 `observability.redact_query_string=true`，用于避免 `/latest?key=...` 的 query string 被写入 Workers logs/traces；部署时不要移除该设置。
 
 ## 通知配置
 
