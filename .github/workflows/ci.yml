@@ -12,7 +12,7 @@ jobs:
         with:
           node-version: 22
       - run: npm install --global npm@11
-      - run: npm install
+      - run: npm ci
       - run: npm test
       - run: npm run lint
       - run: npx wrangler deploy --dry-run
