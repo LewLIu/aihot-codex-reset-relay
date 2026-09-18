@@ -1,0 +1,5 @@
+import { expect, it } from "vitest";
+import { createKvStore } from "../../src/state/kv-store.js";
+function fakeKv(){const data=new Map();const writes=[];return{writes,async get(k){return data.get(k)??null;},async put(k,v){writes.push(k);data.set(k,v);},async delete(k){data.delete(k);},async list({prefix="",cursor}={}){if(cursor)return{keys:[],list_complete:true};return{keys:[...data.keys()].filter((n)=>n.startsWith(prefix)).map((name)=>({name})),list_complete:true};}};}
+it("does not write pending delivery record",async()=>{const kv=fakeKv();const s=createKvStore(kv);await s.ensureSignal({signalId:"post:1",kind:"source_post",targetIds:["wework:a"]});expect(kv.writes).toEqual(["signal:post:1"]);expect(await s.getDelivery("post:1","wework:a")).toBeNull();});
+it("keeps physical families separate",async()=>{const kv=fakeKv();const s=createKvStore(kv);await s.ensureSignal({signalId:"post:1",targetIds:[]});await s.putMeta({stateVersion:4});await s.putDelivery("post:1","wework:a",{status:"sent"});await s.putDiagnostics({status:"ok"});expect(kv.writes).toEqual(["signal:post:1","meta:v4","delivery:post:1:wework:a","diag:last"]);});

@@ -1,0 +1,2 @@
+export function deliveryBackoffMs(attemptCount){return Math.min(30*60_000*2**Math.max(0,attemptCount-1),24*60*60_000);}
+export function classifyDeliveryFailure(result,attemptCount,nowMs){if(!result.retryable||attemptCount>=8)return{status:"permanent_failure",attemptCount,lastErrorCode:result.code??"failure",lastAttemptAt:nowMs};const nextAttemptAt=result.retryAfterMs!=null?nowMs+result.retryAfterMs:nowMs+deliveryBackoffMs(attemptCount);return{status:"retry_wait",attemptCount,nextAttemptAt,lastAttemptAt:nowMs,lastErrorCode:result.code??"failure"};}

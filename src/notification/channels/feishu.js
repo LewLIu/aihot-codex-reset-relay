@@ -1,0 +1,3 @@
+import { plainText } from "../../utils/text.js";
+import { httpFailure, safeJson, timeoutSignal, retryAfterMs } from "./_shared.js";
+export async function send(target,note,{fetchFn=fetch}={}){try{const r=await fetchFn(target.config.url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({msg_type:"text",content:{text:plainText(note)}}),signal:timeoutSignal()});if(!r.ok)return{...httpFailure(r.status),retryAfterMs:retryAfterMs(r)};const j=await safeJson(r);return j?.code===0||j?.StatusCode===0?{ok:true}:{ok:false,retryable:false,code:"feishu_business_error"};}catch(e){return{ok:false,retryable:true,code:e?.name==="TimeoutError"?"timeout":"network"};}}

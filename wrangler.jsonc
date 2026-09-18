@@ -1,0 +1,9 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "aihot-codex-reset-relay",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-16",
+  "kv_namespaces": [{ "binding": "CODEX_RESET_STATE" }],
+  "triggers": { "crons": ["*/30 * * * *"] },
+  "observability": { "enabled": true }
+}
