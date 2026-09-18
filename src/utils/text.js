@@ -1,4 +1,5 @@
 const MASS_MENTION = /@(everyone|channel|here|all)\b/gi;
+const MARKDOWN_SPECIAL = new Set("\\`*_{}[]()#+-.!|>");
 
 export function neutralizeMentions(value) {
   return String(value ?? "").replace(MASS_MENTION, (_match, name) => `@\u200b${name}`);
@@ -20,7 +21,9 @@ export function escapeMrkdwn(value) {
 }
 
 export function escapeMarkdown(value) {
-  return String(value ?? "").replace(/([\\`*_{}[\]()#+\-.!|>])/g, "\\$1");
+  return [...String(value ?? "")]
+    .map((character) => MARKDOWN_SPECIAL.has(character) ? `\\${character}` : character)
+    .join("");
 }
 
 export function safeHttpUrl(value) {
