@@ -1,10 +1,6 @@
-import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
+import fixture from "../fixtures/aihot-response.js";
 import { validateSnapshot } from "../../src/aihot/validate.js";
-
-const fixture = JSON.parse(
-  readFileSync(new URL("../fixtures/aihot-response.json", import.meta.url), "utf8"),
-);
 
 it("accepts schemaVersion 1", () => {
   expect(validateSnapshot(structuredClone(fixture)).schemaVersion).toBe(1);
