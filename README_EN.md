@@ -15,7 +15,7 @@ npx wrangler deploy
 
 Cron: `*/30 * * * *`. KV binding: `CODEX_RESET_STATE`.
 
-Use a random high-entropy (at least 256-bit) `LATEST_ACCESS_KEY` and bookmark `https://YOUR_WORKER.workers.dev/latest?key=YOUR_256_BIT_RANDOM_KEY`. The complete URL is a secret capability; rotate the secret if it leaks. `/latest` rejects HEAD, prefetch/prerender, bad keys, 10-second repeat calls, and active upstream backoff before contacting AIHOT.
+Use a random high-entropy (at least 256-bit) `LATEST_ACCESS_KEY` and bookmark `https://YOUR_WORKER.workers.dev/latest?key=YOUR_256_BIT_RANDOM_KEY`. The complete URL is a secret capability; rotate the secret if it leaks. `/latest` rejects HEAD, prefetch/prerender, bad keys, 10-second repeat calls, and active upstream backoff before contacting AIHOT. `wrangler.jsonc` enables `observability.redact_query_string=true` so the `/latest?key=...` query string is removed from Workers logs and traces; do not remove this setting in production.
 
 Multiple targets use `;`; encode literal semicolons in URLs as `%3B`. Telegram token/chat counts must match. For ntfy, topic count is N; server/token can be absent, one broadcast value, or exactly N values.
 
